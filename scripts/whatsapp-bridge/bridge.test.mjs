@@ -7,7 +7,7 @@ import path from 'node:path';
 // bridge.js is a module with side-effects (starts HTTP server) when run as
 // main. We import only the named exports we need. The server startup is guarded
 // by an import.meta.url check in bridge.js so importing it here is safe.
-import { OBSERVE_NON_SELF, parseObserveNonSelf } from './bridge.js';
+import { OBSERVE_NON_SELF, parseObserveNonSelf, processIncoming } from './bridge.js';
 
 const BRIDGE_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), 'bridge.js');
 
@@ -42,4 +42,50 @@ test('OBSERVE_NON_SELF is true when WHATSAPP_OBSERVE_NON_SELF=true (env→consta
   });
   // execFileSync throws on non-zero exit, so reaching this line means exit 0.
   assert.ok(true, 'child process exited 0 indicating OBSERVE_NON_SELF was true');
+});
+
+// --- Task 2: processIncoming tests ---
+
+test('self-chat mode drops non-self DM when observeNonSelf=false', () => {
+  const result = processIncoming({
+    key: { remoteJid: '15551234567@s.whatsapp.net', fromMe: false, id: 'M1' },
+    pushName: 'Carol',
+    message: { conversation: 'hi' },
+    messageTimestamp: 1716000000,
+  }, { mode: 'self-chat', observeNonSelf: false });
+  assert.equal(result.action, 'ignore');
+  assert.equal(result.reason, 'self_chat_mode_rejects_non_self');
+});
+
+test('self-chat mode forwards non-self DM with observe_only when observeNonSelf=true', () => {
+  const result = processIncoming({
+    key: { remoteJid: '15551234567@s.whatsapp.net', fromMe: false, id: 'M1' },
+    pushName: 'Carol',
+    message: { conversation: 'hi' },
+    messageTimestamp: 1716000000,
+  }, { mode: 'self-chat', observeNonSelf: true });
+  assert.equal(result.action, 'forward');
+  assert.equal(result.payload.observe_only, true);
+  assert.equal(result.payload.body, 'hi');
+});
+
+test('groups are forwarded with observe_only and isGroup=true', () => {
+  const result = processIncoming({
+    key: { remoteJid: '120363@g.us', fromMe: false, id: 'M2', participant: '15551234567@s.whatsapp.net' },
+    pushName: 'Mom',
+    message: { conversation: 'family dinner sunday?' },
+    messageTimestamp: 1716000010,
+  }, { mode: 'self-chat', observeNonSelf: true });
+  assert.equal(result.action, 'forward');
+  assert.equal(result.payload.observe_only, true);
+  assert.equal(result.payload.isGroup, true);
+});
+
+test('status broadcasts stay rejected even with observeNonSelf=true', () => {
+  const result = processIncoming({
+    key: { remoteJid: 'status@broadcast', fromMe: false, id: 'M3' },
+    message: { conversation: 'x' },
+    messageTimestamp: 1716000020,
+  }, { mode: 'self-chat', observeNonSelf: true });
+  assert.equal(result.action, 'ignore');
 });

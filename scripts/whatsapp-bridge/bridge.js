@@ -153,6 +153,84 @@ function getContextInfo(messageContent) {
   return {};
 }
 
+/**
+ * Synchronously extract the text body from a message (no media download).
+ * Returns '' if the message has no extractable text.
+ */
+function extractText(msg) {
+  const messageContent = getMessageContent(msg);
+  if (messageContent.conversation) return messageContent.conversation;
+  if (messageContent.extendedTextMessage?.text) return messageContent.extendedTextMessage.text;
+  if (messageContent.imageMessage?.caption) return messageContent.imageMessage.caption;
+  if (messageContent.videoMessage?.caption) return messageContent.videoMessage.caption;
+  if (messageContent.documentMessage?.caption) return messageContent.documentMessage.caption;
+  return '';
+}
+
+/**
+ * Pure routing function: given a raw Baileys message and runtime options,
+ * returns a decision object:
+ *   { action: 'ignore', reason: string }
+ *   { action: 'forward', payload: object }
+ *
+ * NOTE: this function does NOT perform the isSelfChat number check (which
+ * requires sock.user), allowlist checks, echo-back dedup, or media download.
+ * Those remain in the messages.upsert handler.
+ *
+ * @param {object} msg - Raw Baileys message
+ * @param {object} opts
+ * @param {string} opts.mode - 'self-chat' | 'bot'
+ * @param {boolean} [opts.observeNonSelf] - defaults to module-level OBSERVE_NON_SELF
+ */
+export function processIncoming(msg, { mode, observeNonSelf = OBSERVE_NON_SELF }) {
+  const chatId = msg.key.remoteJid;
+  const fromMe = !!msg.key.fromMe;
+  const isGroup = chatId.endsWith('@g.us');
+  const isBroadcast = chatId.includes('status') || chatId.endsWith('@broadcast');
+
+  if (isBroadcast) return { action: 'ignore', reason: 'broadcast' };
+
+  const senderId = msg.key.participant || msg.key.remoteJid;
+  const body = extractText(msg);
+  const payload = {
+    chatId,
+    fromMe,
+    isGroup,
+    senderId,
+    senderName: msg.pushName || '',
+    messageId: msg.key.id,
+    timestamp: msg.messageTimestamp,
+    body,
+    media: null,
+  };
+
+  if (fromMe) {
+    if (mode === 'self-chat' && !isGroup) {
+      // The user's own message to themselves — process normally.
+      return { action: 'forward', payload };
+    }
+    if (mode === 'self-chat' && isGroup) {
+      if (observeNonSelf) {
+        return { action: 'forward', payload: { ...payload, observe_only: true } };
+      }
+      return { action: 'ignore', reason: 'self_chat_skip_own_group' };
+    }
+    // Bot mode: fromMe messages are echo-backs of our own replies — skip.
+    return { action: 'ignore', reason: 'bot_mode_echo' };
+  }
+
+  // !fromMe path
+  if (mode === 'self-chat') {
+    if (observeNonSelf) {
+      return { action: 'forward', payload: { ...payload, observe_only: true } };
+    }
+    return { action: 'ignore', reason: 'self_chat_mode_rejects_non_self' };
+  }
+
+  // Bot mode: forward for allowlist check in the handler.
+  return { action: 'forward', payload };
+}
+
 mkdirSync(SESSION_DIR, { recursive: true });
 
 // Build LID → phone reverse map from session files (lid-mapping-{phone}.json)
@@ -271,19 +349,26 @@ async function startSocket() {
       const isGroup = chatId.endsWith('@g.us');
       const senderNumber = senderId.replace(/@.*/, '');
 
-      // Handle fromMe messages based on mode
-      if (msg.key.fromMe) {
-        if (isGroup || chatId.includes('status')) continue;
+      // Use processIncoming to decide whether to forward or ignore this message.
+      const decision = processIncoming(msg, { mode: WHATSAPP_MODE });
+      if (decision.action === 'ignore') {
+        try {
+          console.log(JSON.stringify({
+            event: 'ignored',
+            reason: decision.reason,
+            chatId,
+            senderId,
+          }));
+        } catch {}
+        continue;
+      }
 
-        if (WHATSAPP_MODE === 'bot') {
-          // Bot mode: separate number. ALL fromMe are echo-backs of our own replies — skip.
-          continue;
-        }
-
-        // Self-chat mode: only allow messages in the user's own self-chat
-        // WhatsApp now uses LID (Linked Identity Device) format: 67427329167522@lid
-        // AND classic format: 34652029134@s.whatsapp.net
-        // sock.user has both: { id: "number:10@s.whatsapp.net", lid: "lid_number:10@lid" }
+      // decision.action === 'forward'
+      // For fromMe self-chat messages processIncoming returns forward, but we
+      // must still verify it is actually the user's own self-chat by number
+      // (WhatsApp uses LID/classic formats). This guards against edge cases
+      // where fromMe is set on a non-self-chat DM.
+      if (msg.key.fromMe && WHATSAPP_MODE === 'self-chat' && !isGroup) {
         const myNumber = (sock.user?.id || '').replace(/:.*@/, '@').replace(/@.*/, '');
         const myLid = (sock.user?.lid || '').replace(/:.*@/, '@').replace(/@.*/, '');
         const chatNumber = chatId.replace(/@.*/, '');
@@ -291,23 +376,8 @@ async function startSocket() {
         if (!isSelfChat) continue;
       }
 
-      // Handle !fromMe messages (from other people) based on mode.
-      // Self-chat mode only responds to the user's own messages to
-      // themselves — stranger DMs / group pings must never reach the
-      // Python gateway, otherwise a pairing-code reply fires in response
-      // to arbitrary incoming messages (#8389).
-      if (!msg.key.fromMe) {
-        if (WHATSAPP_MODE === 'self-chat') {
-          try {
-            console.log(JSON.stringify({
-              event: 'ignored',
-              reason: 'self_chat_mode_rejects_non_self',
-              chatId,
-              senderId,
-            }));
-          } catch {}
-          continue;
-        }
+      // For bot-mode !fromMe messages, apply the allowlist check.
+      if (!msg.key.fromMe && WHATSAPP_MODE !== 'self-chat' && !decision.payload?.observe_only) {
         if (!matchesAllowedUser(senderId, ALLOWED_USERS, SESSION_DIR)) {
           try {
             console.log(JSON.stringify({
@@ -445,6 +515,7 @@ async function startSocket() {
         hasQuotedMessage,
         botIds,
         timestamp: msg.messageTimestamp,
+        ...(decision.payload?.observe_only ? { observe_only: true } : {}),
       };
 
       messageQueue.push(event);
