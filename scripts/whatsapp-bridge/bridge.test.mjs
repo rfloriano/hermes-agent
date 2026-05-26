@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
@@ -209,4 +210,14 @@ test('computeTypingSeconds respects custom config', () => {
 test('computeTypingSeconds handles empty/null gracefully', () => {
   assert.equal(computeTypingSeconds(''), 1);    // floor
   assert.equal(computeTypingSeconds(null), 1);  // floor
+});
+
+// --- Task 6: stealth invariant — markOnlineOnConnect must stay false ---
+
+test('makeWASocket call includes markOnlineOnConnect: false (stealth invariant)', () => {
+  // Static-source check: if a refactor accidentally removes this option,
+  // the bridge would silently start announcing "online" to senders on connect.
+  // This guard fails loud rather than letting that regression land.
+  const src = readFileSync(BRIDGE_PATH, 'utf8');
+  assert.match(src, /markOnlineOnConnect:\s*false/);
 });
