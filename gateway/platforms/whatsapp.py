@@ -984,6 +984,73 @@ class WhatsAppAdapter(BasePlatformAdapter):
         except Exception as e:
             return SendResult(success=False, error=str(e))
 
+    async def _bridge_post(
+        self,
+        chat_id: str,
+        text: str,
+        reply_to: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Low-level POST of a single text chunk to the bridge /send endpoint.
+
+        Returns the parsed JSON response dict.  Raises on HTTP error or
+        connection failure.
+        """
+        import aiohttp
+
+        payload: Dict[str, Any] = {"chatId": chat_id, "message": text}
+        if reply_to:
+            payload["replyTo"] = reply_to
+
+        async with self._http_session.post(
+            f"http://127.0.0.1:{self._bridge_port}/send",
+            json=payload,
+            timeout=aiohttp.ClientTimeout(total=30),
+        ) as resp:
+            if resp.status == 200:
+                return await resp.json()
+            error = await resp.text()
+            raise RuntimeError(f"Bridge /send error {resp.status}: {error}")
+
+    async def send_message(
+        self,
+        chat_id: str,
+        text: str,
+        *,
+        hermes_origin: bool = True,
+        reply_to: Optional[str] = None,
+    ) -> SendResult:
+        """Send a single text message and emit the message:sent hook.
+
+        This is the hook-aware façade over _bridge_post.  The existing
+        ``send()`` method handles formatting + chunking; this method is
+        intentionally thin — one bridge call, one hook emission.
+        """
+        try:
+            result = await self._bridge_post(chat_id, text, reply_to=reply_to)
+        except Exception as e:
+            return SendResult(success=False, error=str(e))
+
+        message_id = result.get("message_id") or result.get("messageId")
+
+        event: Dict[str, Any] = {
+            "chatId": chat_id,
+            "messageId": message_id,
+            "body": text,
+            "hermes_origin": hermes_origin,
+            "direction": "out",
+        }
+        timestamp = result.get("timestamp")
+        if timestamp is not None:
+            event["timestamp"] = timestamp
+
+        if self._hook_registry is not None:
+            try:
+                await self._hook_registry.emit("message:sent", event)
+            except Exception:
+                logger.exception("[%s] message:sent hook raised", self.name)
+
+        return SendResult(success=True, message_id=message_id)
+
     async def edit_message(
         self,
         chat_id: str,
