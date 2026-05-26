@@ -1024,7 +1024,22 @@ function buildBackfillRecord(msg) {
   else if (messageContent.audioMessage || messageContent.pttMessage) kind = messageContent.pttMessage ? 'ptt' : 'audio';
   else if (messageContent.documentMessage) kind = 'document';
   else if (messageContent.stickerMessage) kind = 'sticker';
-  const ts = msg.messageTimestamp;
+  // msg.messageTimestamp is a protobuf Long in Baileys 7.x; JSON.stringify
+  // serializes Long objects as {low, high, unsigned} which Python's
+  // archive.write_message can't parse — it then falls back to now(),
+  // wiping the real message timestamp. Coerce to a plain Unix seconds
+  // number here so the wire payload is JSON-clean.
+  const tsRaw = msg.messageTimestamp;
+  let timestamp = null;
+  if (typeof tsRaw === 'number') {
+    timestamp = tsRaw;
+  } else if (typeof tsRaw === 'string') {
+    timestamp = parseInt(tsRaw, 10);
+  } else if (tsRaw && typeof tsRaw.toNumber === 'function') {
+    timestamp = tsRaw.toNumber();
+  } else if (tsRaw && typeof tsRaw === 'object' && 'low' in tsRaw) {
+    timestamp = tsRaw.low + (tsRaw.high || 0) * 0x100000000;
+  }
   return {
     messageId: msg.key?.id,
     chatId,
@@ -1035,7 +1050,7 @@ function buildBackfillRecord(msg) {
     body: body || (kind !== 'text' ? `[${kind} received]` : ''),
     kind,
     media_ref: mediaRef,
-    timestamp: ts,
+    timestamp,
     isGroup,
     observe_only: false,
     hermes_origin: false,
