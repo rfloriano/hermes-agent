@@ -16817,7 +16817,10 @@ class GatewayRunner:
             _history_media_paths: set = set()
             for _hm in agent_history:
                 if _hm.get("role") in {"tool", "function"}:
-                    _hc = _hm.get("content", "")
+                    # NB: dict.get(k, default) returns default only when k is
+                    # missing — explicit None values fall through, so we'd
+                    # crash on `"MEDIA:" in None`. Use `or ""` to coerce.
+                    _hc = _hm.get("content") or ""
                     if "MEDIA:" in _hc:
                         _TOOL_MEDIA_RE = re.compile(
                             r'MEDIA:((?:/|~\/)\S+\.(?:png|jpe?g|gif|webp|'
