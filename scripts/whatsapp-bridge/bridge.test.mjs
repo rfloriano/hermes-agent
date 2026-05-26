@@ -1,10 +1,15 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import path from 'node:path';
 
 // bridge.js is a module with side-effects (starts HTTP server) when run as
 // main. We import only the named exports we need. The server startup is guarded
 // by an import.meta.url check in bridge.js so importing it here is safe.
 import { OBSERVE_NON_SELF, parseObserveNonSelf } from './bridge.js';
+
+const BRIDGE_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), 'bridge.js');
 
 test('WHATSAPP_OBSERVE_NON_SELF defaults to false', () => {
   // OBSERVE_NON_SELF is the module-level constant evaluated at import time.
@@ -25,4 +30,16 @@ test('parseObserveNonSelf returns true when value is "true"', () => {
   assert.equal(parseObserveNonSelf('true'), true);
   assert.equal(parseObserveNonSelf('TRUE'), true);
   assert.equal(parseObserveNonSelf('True'), true);
+});
+
+test('OBSERVE_NON_SELF is true when WHATSAPP_OBSERVE_NON_SELF=true (env→constant wiring)', () => {
+  // ESM modules cache once per process, so we verify the env-var wiring
+  // by spawning a fresh node process with the env set.
+  const script = `import('${BRIDGE_PATH}').then(m => process.exit(m.OBSERVE_NON_SELF ? 0 : 1)).catch(e => { console.error(e); process.exit(2); });`;
+  const result = execFileSync('node', ['--input-type=module', '-e', script], {
+    env: { ...process.env, WHATSAPP_OBSERVE_NON_SELF: 'true' },
+    encoding: 'utf8',
+  });
+  // execFileSync throws on non-zero exit, so reaching this line means exit 0.
+  assert.ok(true, 'child process exited 0 indicating OBSERVE_NON_SELF was true');
 });
