@@ -24,6 +24,7 @@ import re
 import shutil
 import signal
 import subprocess
+from datetime import datetime, timezone
 
 _IS_WINDOWS = platform.system() == "Windows"
 from pathlib import Path
@@ -277,6 +278,8 @@ class WhatsAppAdapter(BasePlatformAdapter):
         # "Fatal whatsapp adapter error" plus dispatch a fatal-error
         # notification before the normal "✓ whatsapp disconnected" fires.
         self._shutting_down: bool = False
+        # Optional hook registry injected by run.py after construction.
+        self._hook_registry = None
 
     def _effective_reply_prefix(self) -> str:
         """Return the prefix the Node bridge will add in self-chat mode."""
@@ -484,7 +487,62 @@ class WhatsAppAdapter(BasePlatformAdapter):
         if self._message_mentions_bot(data):
             return True
         return self._message_matches_mention_patterns(data)
-    
+
+    def set_hook_registry(self, registry) -> None:
+        """Inject the gateway HookRegistry so hooks can be emitted."""
+        self._hook_registry = registry
+
+    # ------------------------------------------------------------------
+    # Engagement window helpers (stub — filled in by Task 10)
+    # ------------------------------------------------------------------
+
+    def _engagements_path(self) -> Path:
+        from hermes_constants import get_hermes_home
+        return get_hermes_home() / "whatsapp" / "engagements.json"
+
+    def _engagement_active_for_chat(self, chat_id: str) -> bool:
+        """True if there is a non-expired engagement window for chat_id."""
+        # Stub: Task 10 replaces this with real engagements.json logic.
+        return False
+
+    # ------------------------------------------------------------------
+    # Unified inbound-event handler (called from poll loop)
+    # ------------------------------------------------------------------
+
+    async def _handle_incoming_event(self, data: dict) -> None:
+        """Process a single raw inbound event from the bridge.
+
+        Steps (in order):
+        1. Emit message:received hook (always, before any gating).
+        2. If observe_only and no active engagement window, return early.
+        3. Gate via _should_process_message.
+        4. Dispatch to agent.
+        """
+        # 1. Emit hook before gating.
+        if self._hook_registry is not None:
+            try:
+                await self._hook_registry.emit("message:received", data)
+            except Exception:
+                logger.exception("[%s] message:received hook raised", self.name)
+
+        # 2. Observe-only messages only reach the agent if an engagement is active.
+        if data.get("observe_only"):
+            if not self._engagement_active_for_chat(data.get("chatId", "")):
+                return
+
+        # 3. Standard processing gate.
+        if not self._should_process_message(data):
+            return
+
+        # 4. Dispatch to agent.
+        await self._dispatch_to_agent(data)
+
+    async def _dispatch_to_agent(self, data: dict) -> None:
+        """Build a MessageEvent from raw data and hand it off to handle_message."""
+        event = await self._build_message_event(data)
+        if event:
+            await self.handle_message(event)
+
     async def connect(self) -> bool:
         """
         Start the WhatsApp bridge.
@@ -1137,9 +1195,7 @@ class WhatsAppAdapter(BasePlatformAdapter):
                     if resp.status == 200:
                         messages = await resp.json()
                         for msg_data in messages:
-                            event = await self._build_message_event(msg_data)
-                            if event:
-                                await self.handle_message(event)
+                            await self._handle_incoming_event(msg_data)
             except asyncio.CancelledError:
                 break
             except Exception as e:
