@@ -1042,6 +1042,8 @@ class WhatsAppAdapter(BasePlatformAdapter):
         chat_id: str,
         text: str,
         reply_to: Optional[str] = None,
+        mark_read: Optional[bool] = None,
+        typing_enabled: Optional[bool] = None,
     ) -> Dict[str, Any]:
         """Low-level POST of a single text chunk to the bridge /send endpoint.
 
@@ -1053,6 +1055,10 @@ class WhatsAppAdapter(BasePlatformAdapter):
         payload: Dict[str, Any] = {"chatId": chat_id, "message": text}
         if reply_to:
             payload["replyTo"] = reply_to
+        if mark_read is not None:
+            payload["mark_read"] = mark_read
+        if typing_enabled is not None:
+            payload["typing_enabled"] = typing_enabled
 
         async with self._http_session.post(
             f"http://127.0.0.1:{self._bridge_port}/send",
@@ -1071,15 +1077,32 @@ class WhatsAppAdapter(BasePlatformAdapter):
         *,
         hermes_origin: bool = True,
         reply_to: Optional[str] = None,
+        mark_read: Optional[bool] = None,
+        typing_enabled: Optional[bool] = None,
     ) -> SendResult:
         """Send a single text message and emit the message:sent hook.
 
         This is the hook-aware façade over _bridge_post.  The existing
         ``send()`` method handles formatting + chunking; this method is
         intentionally thin — one bridge call, one hook emission.
+
+        ``mark_read`` and ``typing_enabled`` control bridge-side side-effects.
+        When either is None the value is derived from the current mode: in
+        self-chat mode both default to False; otherwise both default to True.
         """
+        whatsapp_mode = os.getenv("WHATSAPP_MODE", "self-chat")
+        is_self_chat = whatsapp_mode == "self-chat"
+        if mark_read is None:
+            mark_read = not is_self_chat
+        if typing_enabled is None:
+            typing_enabled = not is_self_chat
         try:
-            result = await self._bridge_post(chat_id, text, reply_to=reply_to)
+            result = await self._bridge_post(
+                chat_id, text,
+                reply_to=reply_to,
+                mark_read=mark_read,
+                typing_enabled=typing_enabled,
+            )
         except Exception as e:
             return SendResult(success=False, error=str(e))
 
