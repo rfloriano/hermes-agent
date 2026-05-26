@@ -985,6 +985,196 @@ app.post('/mark-read', async (req, res) => {
   }
 });
 
+// Backfill history for a specific chat.
+// POST /backfill { chatId, days?, count?, oldest_message_id?, oldest_timestamp? }
+//
+// Asks Baileys to fetch server-side history older than the provided anchor
+// point (or the current time if none given). Because fetchMessageHistory in
+// Baileys 7.x is event-driven — it issues a peer-data-operation request and
+// messages arrive asynchronously via 'messaging-history.set' — this handler
+// sets up a one-shot listener correlated by peerDataRequestSessionId, then
+// loops until it has collected enough messages or timed out.
+//
+// Returns:
+//   { success: true, fetched: N, oldest_ts: <ISO>, newest_ts: <ISO>, messages: [...] }
+//   { success: false, error: "<message>", partial: [...] }
+const BACKFILL_TIMEOUT_MS = parseInt(process.env.WHATSAPP_BACKFILL_TIMEOUT_MS || '30000', 10);
+const BACKFILL_EMPTY_RETRY = 1; // retry once if first batch is empty
+
+/**
+ * Build a message payload identical in shape to what processIncoming / the
+ * messages.upsert handler would produce, but for a history-sync message.
+ * Media is intentionally skipped in v1 (media_ref = null).
+ */
+function buildBackfillRecord(msg) {
+  const chatId = msg.key?.remoteJid;
+  if (!chatId) return null;
+  const isBroadcast = chatId.includes('status') || chatId.endsWith('@broadcast');
+  if (isBroadcast) return null;
+  const fromMe = !!msg.key?.fromMe;
+  const isGroup = chatId.endsWith('@g.us');
+  const senderId = msg.key?.participant || chatId;
+  const body = extractText(msg);
+  const messageContent = getMessageContent(msg);
+  // Determine kind from message content (no download — placeholders only)
+  let kind = 'text';
+  let mediaRef = null;
+  if (messageContent.imageMessage) kind = 'image';
+  else if (messageContent.videoMessage) kind = 'video';
+  else if (messageContent.audioMessage || messageContent.pttMessage) kind = messageContent.pttMessage ? 'ptt' : 'audio';
+  else if (messageContent.documentMessage) kind = 'document';
+  else if (messageContent.stickerMessage) kind = 'sticker';
+  const ts = msg.messageTimestamp;
+  return {
+    messageId: msg.key?.id,
+    chatId,
+    fromMe,
+    isGroup,
+    senderId,
+    senderName: msg.pushName || '',
+    body: body || (kind !== 'text' ? `[${kind} received]` : ''),
+    kind,
+    media_ref: mediaRef,
+    timestamp: ts,
+    isGroup,
+    observe_only: false,
+    hermes_origin: false,
+  };
+}
+
+/**
+ * Wait for a 'messaging-history.set' event whose peerDataRequestSessionId
+ * matches requestId. Resolves with the event payload or rejects on timeout.
+ */
+function waitForHistoryEvent(requestId, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      sock.ev.off('messaging-history.set', handler);
+      reject(new Error('timeout'));
+    }, timeoutMs);
+
+    function handler(event) {
+      // Match by peerDataRequestSessionId when present; fall back to accepting
+      // any ON_DEMAND sync event if the sessionId is absent (Baileys race).
+      const sid = event.peerDataRequestSessionId;
+      if (sid && sid !== requestId) return;
+      clearTimeout(timer);
+      sock.ev.off('messaging-history.set', handler);
+      resolve(event);
+    }
+
+    sock.ev.on('messaging-history.set', handler);
+  });
+}
+
+app.post('/backfill', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+
+  const {
+    chatId,
+    days = 10,
+    count = 500,
+    oldest_message_id: oldestMsgId,
+    oldest_timestamp: oldestTs,
+  } = req.body || {};
+
+  if (!chatId) {
+    return res.status(400).json({ error: 'chatId is required' });
+  }
+
+  const cutoffTs = Date.now() / 1000 - days * 86400;
+  const maxCount = Math.max(1, parseInt(count, 10) || 500);
+
+  // Build the anchor key from caller-supplied ids, or use "now" as starting point.
+  let anchorKey = {
+    remoteJid: chatId,
+    fromMe: false,
+    id: oldestMsgId || 'NONE',
+  };
+  let anchorTs = oldestTs ? Number(oldestTs) : Math.floor(Date.now() / 1000);
+
+  const collected = [];
+  let emptyRetries = 0;
+
+  try {
+    while (collected.length < maxCount) {
+      // Issue the request — fetchMessageHistory returns a peer-op message ID
+      // (which serves as peerDataRequestSessionId in the response event).
+      const requestId = await sock.fetchMessageHistory(
+        Math.min(maxCount - collected.length, 100),
+        anchorKey,
+        anchorTs * 1000, // Baileys expects ms for the PDO request
+      );
+
+      let event;
+      try {
+        event = await waitForHistoryEvent(requestId, BACKFILL_TIMEOUT_MS);
+      } catch (timeoutErr) {
+        // Timeout — return whatever we have so far.
+        return res.json({
+          success: false,
+          error: 'timeout',
+          partial: collected,
+        });
+      }
+
+      const msgs = event.messages || [];
+      if (msgs.length === 0) {
+        emptyRetries += 1;
+        if (emptyRetries > BACKFILL_EMPTY_RETRY) break;
+        continue;
+      }
+      emptyRetries = 0;
+
+      let reachedCutoff = false;
+      for (const msg of msgs) {
+        const ts = Number(msg.messageTimestamp || 0);
+        if (ts > 0 && ts < cutoffTs) {
+          reachedCutoff = true;
+          continue; // skip messages older than requested window
+        }
+        const record = buildBackfillRecord(msg);
+        if (record) collected.push(record);
+      }
+
+      if (reachedCutoff) break;
+
+      // Advance anchor to the oldest message in this batch for the next loop.
+      const sorted = msgs
+        .filter(m => m.key?.id && m.messageTimestamp)
+        .sort((a, b) => Number(a.messageTimestamp) - Number(b.messageTimestamp));
+      if (sorted.length === 0) break;
+      const oldest = sorted[0];
+      anchorKey = { remoteJid: chatId, fromMe: !!oldest.key.fromMe, id: oldest.key.id };
+      anchorTs = Number(oldest.messageTimestamp);
+
+      // If the server indicated this is the full history, stop looping.
+      if (event.isLatest) break;
+      // Avoid hammering WhatsApp between loop iterations.
+      await sleep(500);
+    }
+
+    const timestamps = collected
+      .map(m => m.timestamp)
+      .filter(t => t && t > 0)
+      .map(Number);
+    const oldestTsOut = timestamps.length ? Math.min(...timestamps) : null;
+    const newestTsOut = timestamps.length ? Math.max(...timestamps) : null;
+
+    return res.json({
+      success: true,
+      fetched: collected.length,
+      oldest_ts: oldestTsOut ? new Date(oldestTsOut * 1000).toISOString() : null,
+      newest_ts: newestTsOut ? new Date(newestTsOut * 1000).toISOString() : null,
+      messages: collected,
+    });
+  } catch (err) {
+    return res.json({ success: false, error: err.message });
+  }
+});
+
 // Chat info
 app.get('/chat/:id', async (req, res) => {
   const chatId = req.params.id;

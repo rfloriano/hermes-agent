@@ -257,3 +257,43 @@ test('bridge.js exposes a /mark-read endpoint', () => {
   assert.match(src, /sock\.readMessages\(keys\)/);
 });
 
+// --- /backfill endpoint: source-level sanity ---
+
+test('bridge.js exposes a /backfill endpoint', () => {
+  const src = readFileSync(BRIDGE_PATH, 'utf8');
+  assert.match(src, /app\.post\(['"]\/backfill['"]/);
+});
+
+test('/backfill handler validates chatId — missing chatId triggers 400 response', () => {
+  const src = readFileSync(BRIDGE_PATH, 'utf8');
+  // Guard: the handler must check for chatId and return a 400.
+  assert.match(src, /chatId is required/);
+  assert.match(src, /status\(400\)/);
+});
+
+test('/backfill handler uses sock.fetchMessageHistory', () => {
+  const src = readFileSync(BRIDGE_PATH, 'utf8');
+  assert.match(src, /sock\.fetchMessageHistory\(/);
+});
+
+test('/backfill handler waits for messaging-history.set event', () => {
+  const src = readFileSync(BRIDGE_PATH, 'utf8');
+  assert.match(src, /messaging-history\.set/);
+});
+
+test('/backfill returns timeout error on slow WhatsApp response', () => {
+  const src = readFileSync(BRIDGE_PATH, 'utf8');
+  assert.match(src, /timeout/);
+  assert.match(src, /success:\s*false/);
+});
+
+test('buildBackfillRecord extracts text and kind (source-level)', () => {
+  const src = readFileSync(BRIDGE_PATH, 'utf8');
+  // The helper function must exist.
+  assert.match(src, /function buildBackfillRecord/);
+  // It must call extractText for body extraction.
+  assert.match(src, /extractText\(msg\)/);
+  // It must set kind for media types.
+  assert.match(src, /imageMessage.*kind.*image|kind.*image.*imageMessage/s);
+});
+
