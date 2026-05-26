@@ -1087,11 +1087,32 @@ app.post('/backfill', async (req, res) => {
   const cutoffTs = Date.now() / 1000 - days * 86400;
   const maxCount = Math.max(1, parseInt(count, 10) || 500);
 
-  // Build the anchor key from caller-supplied ids, or use "now" as starting point.
+  // fetchMessageHistory needs a REAL anchor key (a message that exists in
+  // this chat on WhatsApp's server) — it fetches messages OLDER than that
+  // anchor. Without one, the PDO request either returns empty or times
+  // out (silent — there's no "invalid anchor" error from WhatsApp).
+  //
+  // Earlier we passed `id: 'NONE'` as a placeholder; that silently produced
+  // garbage results indistinguishable from "no history available". Refuse
+  // the request explicitly instead and let the caller skip the chat with
+  // a clear reason.
+  if (!oldestMsgId) {
+    return res.json({
+      success: false,
+      error: 'no_anchor',
+      reason:
+        'fetchMessageHistory requires a real existing message id from this chat as anchor. ' +
+        'Caller must supply oldest_message_id (and oldest_timestamp). ' +
+        'For empty-archive chats, there is no anchor available and history ' +
+        'cannot be fetched without observing live traffic first.',
+    });
+  }
+
+  // Build the anchor key from caller-supplied ids.
   let anchorKey = {
     remoteJid: chatId,
     fromMe: false,
-    id: oldestMsgId || 'NONE',
+    id: oldestMsgId,
   };
   let anchorTs = oldestTs ? Number(oldestTs) : Math.floor(Date.now() / 1000);
 
