@@ -89,3 +89,17 @@ test('status broadcasts stay rejected even with observeNonSelf=true', () => {
   }, { mode: 'self-chat', observeNonSelf: true });
   assert.equal(result.action, 'ignore');
 });
+
+test('self-chat reply path: fromMe DM in self-chat forwards without observe_only (regression guard)', () => {
+  // The user's own self-chat message — the channel where they talk to the
+  // bot via WhatsApp. This MUST continue to forward as today; observe_only
+  // must be absent so the agent runs (not treated as observation).
+  const result = processIncoming({
+    key: { remoteJid: '15557654321@s.whatsapp.net', fromMe: true, id: 'SELF-1' },
+    pushName: 'Owner',
+    message: { conversation: '/status' },
+    messageTimestamp: 1716000030,
+  }, { mode: 'self-chat', observeNonSelf: true });
+  assert.equal(result.action, 'forward');
+  assert.notEqual(result.payload.observe_only, true);
+});
