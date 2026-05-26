@@ -1040,13 +1040,36 @@ function buildBackfillRecord(msg) {
   } else if (tsRaw && typeof tsRaw === 'object' && 'low' in tsRaw) {
     timestamp = tsRaw.low + (tsRaw.high || 0) * 0x100000000;
   }
+
+  // Backfilled messages don't carry msg.pushName (that's a live-only field).
+  // Best-effort fallback: if the senderId is a LID we have a reverse
+  // mapping for, surface the resolved phone number as sender_e164 AND use
+  // it as the displayed sender_name when no other name is available. The
+  // lidToPhone map is built from the session's lid-mapping-*.json files
+  // and refreshed on every creds.update event.
+  let resolvedE164 = null;
+  if (senderId && senderId.endsWith('@lid')) {
+    const lidValue = senderId.split('@', 1)[0];
+    const phone = lidToPhone[lidValue];
+    if (phone) {
+      resolvedE164 = '+' + phone;
+    }
+  } else if (senderId && senderId.endsWith('@s.whatsapp.net')) {
+    const phonePart = senderId.split('@', 1)[0];
+    if (/^\d+$/.test(phonePart)) {
+      resolvedE164 = '+' + phonePart;
+    }
+  }
+  const senderName = msg.pushName || resolvedE164 || '';
+
   return {
     messageId: msg.key?.id,
     chatId,
     fromMe,
     isGroup,
     senderId,
-    senderName: msg.pushName || '',
+    senderName,
+    sender_e164: resolvedE164,
     body: body || (kind !== 'text' ? `[${kind} received]` : ''),
     kind,
     media_ref: mediaRef,
