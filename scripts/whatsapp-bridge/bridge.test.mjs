@@ -8,7 +8,7 @@ import path from 'node:path';
 // bridge.js is a module with side-effects (starts HTTP server) when run as
 // main. We import only the named exports we need. The server startup is guarded
 // by an import.meta.url check in bridge.js so importing it here is safe.
-import { OBSERVE_NON_SELF, parseObserveNonSelf, processIncoming, recordHermesSend, markRecentHermesSendForChat, getUnreadKeysForChat, drainUnreadKeysForChat, computeTypingSeconds } from './bridge.js';
+import { OBSERVE_NON_SELF, parseObserveNonSelf, processIncoming, recordHermesSend, markRecentHermesSendForChat, getUnreadKeysForChat, drainUnreadKeysForChat, computeTypingSeconds, formatOutgoingMessage } from './bridge.js';
 
 const BRIDGE_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), 'bridge.js');
 
@@ -220,4 +220,27 @@ test('makeWASocket call includes markOnlineOnConnect: false (stealth invariant)'
   // This guard fails loud rather than letting that regression land.
   const src = readFileSync(BRIDGE_PATH, 'utf8');
   assert.match(src, /markOnlineOnConnect:\s*false/);
+});
+
+// --- prefix_override: formatOutgoingMessage tests ---
+
+test('formatOutgoingMessage with prefixOverride="" returns raw message in self-chat mode', () => {
+  // Empty string override suppresses the default REPLY_PREFIX entirely.
+  assert.equal(formatOutgoingMessage('hi', { prefixOverride: '' }, 'self-chat'), 'hi');
+});
+
+test('formatOutgoingMessage with no opts uses default REPLY_PREFIX in self-chat mode', () => {
+  // When no prefixOverride is supplied the default prefix must be prepended.
+  const DEFAULT_REPLY_PREFIX = '⚕ *Hermes Agent*\n────────────\n';
+  assert.equal(
+    formatOutgoingMessage('hi', {}, 'self-chat'),
+    `${DEFAULT_REPLY_PREFIX}hi`,
+  );
+});
+
+test('formatOutgoingMessage with prefixOverride="[via bot] " uses custom prefix', () => {
+  assert.equal(
+    formatOutgoingMessage('hi', { prefixOverride: '[via bot] ' }, 'self-chat'),
+    '[via bot] hi',
+  );
 });

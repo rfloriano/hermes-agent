@@ -86,11 +86,15 @@ function sendWithTimeout(chatId, payload, timeoutMs = SEND_TIMEOUT_MS) {
     .finally(() => clearTimeout(timer));
 }
 
-function formatOutgoingMessage(message) {
+export function formatOutgoingMessage(message, opts = {}, mode = WHATSAPP_MODE) {
   // In bot mode, messages come from a different number so the prefix is
   // redundant — the sender identity is already clear.  Only prepend in
   // self-chat mode where bot and user share the same number.
-  if (WHATSAPP_MODE !== 'self-chat') return message;
+  if (mode !== 'self-chat') return message;
+  // If caller provided a prefix_override (even empty string), use it verbatim.
+  if ('prefixOverride' in opts) {
+    return opts.prefixOverride ? `${opts.prefixOverride}${message}` : message;
+  }
   return REPLY_PREFIX ? `${REPLY_PREFIX}${message}` : message;
 }
 
@@ -730,10 +734,13 @@ app.post('/send', async (req, res) => {
     mark_read: markRead = false,
     typing_enabled: typingEnabled = true,
     typing_seconds: typingSeconds,
+    prefix_override: prefixOverride,
   } = req.body;
   if (!chatId || !message) {
     return res.status(400).json({ error: 'chatId and message are required' });
   }
+
+  const fmtOpts = prefixOverride !== undefined ? { prefixOverride } : {};
 
   try {
     // mark_read: drain unread keys and mark them read before sending
@@ -744,7 +751,7 @@ app.post('/send', async (req, res) => {
       }
     }
 
-    const chunks = splitLongMessage(formatOutgoingMessage(message));
+    const chunks = splitLongMessage(formatOutgoingMessage(message, fmtOpts));
     const messageIds = [];
     for (let i = 0; i < chunks.length; i += 1) {
       // Typing indicator only before the first chunk; subsequent chunks send immediately.
