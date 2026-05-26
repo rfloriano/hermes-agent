@@ -2266,7 +2266,10 @@ class AIAgent:
         for msg in reversed(history):
             if msg.get("role") != "tool":
                 continue
-            content = msg.get("content", "")
+            # NB: dict.get(k, default) only falls back when k is MISSING.
+            # Explicit None values (e.g. from an aborted tool call) would
+            # crash the `in` / json.loads below. Coerce to str.
+            content = msg.get("content") or ""
             # Quick check: todo responses contain "todos" key
             if '"todos"' not in content:
                 continue
