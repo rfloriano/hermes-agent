@@ -7,7 +7,7 @@ import path from 'node:path';
 // bridge.js is a module with side-effects (starts HTTP server) when run as
 // main. We import only the named exports we need. The server startup is guarded
 // by an import.meta.url check in bridge.js so importing it here is safe.
-import { OBSERVE_NON_SELF, parseObserveNonSelf, processIncoming, recordHermesSend, markRecentHermesSendForChat } from './bridge.js';
+import { OBSERVE_NON_SELF, parseObserveNonSelf, processIncoming, recordHermesSend, markRecentHermesSendForChat, getUnreadKeysForChat, drainUnreadKeysForChat, computeTypingSeconds } from './bridge.js';
 
 const BRIDGE_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), 'bridge.js');
 
@@ -136,4 +136,57 @@ test('fallback tags hermes_origin via recentlySent timestamp window', () => {
     messageTimestamp: Math.floor(Date.now() / 1000),
   }, { mode: 'self-chat', observeNonSelf: true });
   assert.equal(result.payload.hermes_origin, true);
+});
+
+// --- Task 4: Per-chat unread-keys queue ---
+
+test('observed inbound DM appends key to unread queue', () => {
+  // Use unique chatId to avoid state leakage.
+  const chatId = '15550000010@s.whatsapp.net';
+  processIncoming({
+    key: { remoteJid: chatId, fromMe: false, id: 'M1-task4a' },
+    message: { conversation: 'hi' },
+    messageTimestamp: 1716000000,
+  }, { mode: 'self-chat', observeNonSelf: true });
+
+  const keys = getUnreadKeysForChat(chatId);
+  assert.equal(keys.length, 1);
+  assert.equal(keys[0].id, 'M1-task4a');
+});
+
+test('drainUnreadKeysForChat empties the queue', () => {
+  const chatId = '15550000011@s.whatsapp.net';
+  processIncoming({
+    key: { remoteJid: chatId, fromMe: false, id: 'M1-task4b' },
+    message: { conversation: 'hi' },
+    messageTimestamp: 1716000000,
+  }, { mode: 'self-chat', observeNonSelf: true });
+
+  const drained = drainUnreadKeysForChat(chatId);
+  assert.equal(drained.length, 1);
+  const second = drainUnreadKeysForChat(chatId);
+  assert.equal(second.length, 0);
+});
+
+test('non-self group message also appends to unread queue', () => {
+  const chatId = '120363-task4c@g.us';
+  processIncoming({
+    key: { remoteJid: chatId, fromMe: false, id: 'GM1-task4c', participant: '15551234567@s.whatsapp.net' },
+    message: { conversation: 'hi family' },
+    messageTimestamp: 1716000010,
+  }, { mode: 'self-chat', observeNonSelf: true });
+  const keys = getUnreadKeysForChat(chatId);
+  assert.equal(keys.length, 1);
+  assert.equal(keys[0].participant, '15551234567@s.whatsapp.net');
+});
+
+test('outbound (fromMe) does NOT append to unread queue', () => {
+  const chatId = '15550000013@s.whatsapp.net';
+  processIncoming({
+    key: { remoteJid: chatId, fromMe: true, id: 'OUT-1' },
+    message: { conversation: 'mine' },
+    messageTimestamp: 1716000020,
+  }, { mode: 'self-chat', observeNonSelf: true });
+  const keys = getUnreadKeysForChat(chatId);
+  assert.equal(keys.length, 0);
 });

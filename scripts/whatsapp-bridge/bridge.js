@@ -227,12 +227,22 @@ export function processIncoming(msg, { mode, observeNonSelf = OBSERVE_NON_SELF }
   // !fromMe path
   if (mode === 'self-chat') {
     if (observeNonSelf) {
+      appendUnread(chatId, {
+        remoteJid: chatId,
+        id: msg.key.id,
+        ...(msg.key.participant ? { participant: msg.key.participant } : {}),
+      });
       return { action: 'forward', payload: { ...payload, observe_only: true } };
     }
     return { action: 'ignore', reason: 'self_chat_mode_rejects_non_self' };
   }
 
   // Bot mode: forward for allowlist check in the handler.
+  appendUnread(chatId, {
+    remoteJid: chatId,
+    id: msg.key.id,
+    ...(msg.key.participant ? { participant: msg.key.participant } : {}),
+  });
   return { action: 'forward', payload };
 }
 
@@ -309,6 +319,45 @@ export function markRecentHermesSendForChat(chatId, tsMs) {
   }
 }
 
+// --- Task 4: Per-chat unread-keys queue ---
+// Tracks message keys for !fromMe messages that have been forwarded but not yet
+// marked read. Drained by the HTTP send endpoints when mark_read=true.
+const UNREAD_KEYS = new Map();
+
+/**
+ * Append a message key to the per-chat unread queue.
+ * @param {string} chatId
+ * @param {{ remoteJid: string, id: string, participant?: string }} key
+ */
+function appendUnread(chatId, key) {
+  if (!UNREAD_KEYS.has(chatId)) UNREAD_KEYS.set(chatId, []);
+  UNREAD_KEYS.get(chatId).push(key);
+}
+
+/**
+ * Return a copy of the unread keys for the given chat (non-destructive).
+ * @param {string} chatId
+ * @returns {Array}
+ */
+export function getUnreadKeysForChat(chatId) {
+  return [...(UNREAD_KEYS.get(chatId) || [])];
+}
+
+/**
+ * Drain (remove and return) all unread keys for the given chat.
+ * @param {string} chatId
+ * @returns {Array}
+ */
+export function drainUnreadKeysForChat(chatId) {
+  const keys = UNREAD_KEYS.get(chatId) || [];
+  UNREAD_KEYS.delete(chatId);
+  return keys;
+}
+
+// --- Task 5: Typing / presence helpers (implemented below after TYPING_CFG) ---
+// Forward declaration — full implementation follows after module-level constants.
+// computeTypingSeconds is exported at definition site below.
+
 /**
  * Returns true if the given message appears to have originated from Hermes.
  * Uses either an exact message-ID match or a recency window fallback.
@@ -318,6 +367,48 @@ function isHermesOrigin(chatId, messageId) {
   const lastSent = HERMES_RECENT_BY_CHAT.get(chatId);
   if (lastSent !== undefined && Date.now() - lastSent <= RECENT_WINDOW_MS) return true;
   return false;
+}
+
+// --- Task 5: Typing config and helpers ---
+const TYPING_CFG = {
+  enabled: (process.env.WHATSAPP_TYPING_ENABLED ?? 'true').toLowerCase() === 'true',
+  charsPerSecond: Number(process.env.WHATSAPP_TYPING_CPS ?? 15),
+  min: Number(process.env.WHATSAPP_TYPING_MIN_SECONDS ?? 1),
+  max: Number(process.env.WHATSAPP_TYPING_MAX_SECONDS ?? 8),
+};
+
+/**
+ * Compute how many seconds to show the typing indicator before sending.
+ * Scales linearly with message length, clamped to [cfg.min, cfg.max].
+ * @param {string|null} text
+ * @param {{ charsPerSecond?: number, min?: number, max?: number }} [cfg]
+ * @returns {number}
+ */
+export function computeTypingSeconds(text, cfg = TYPING_CFG) {
+  const len = (text || '').length;
+  const cps = cfg.charsPerSecond ?? TYPING_CFG.charsPerSecond;
+  const min = cfg.min ?? TYPING_CFG.min;
+  const max = cfg.max ?? TYPING_CFG.max;
+  return Math.max(min, Math.min(max, Math.round(len / cps)));
+}
+
+/**
+ * Send composing presence, wait, send paused, then call sock.sendMessage.
+ * @param {object} sock - Baileys socket
+ * @param {string} chatId
+ * @param {string} text
+ * @param {{ typingEnabled?: boolean, typingSeconds?: number }} [opts]
+ * @returns {Promise}
+ */
+async function performTypingAndSend(sock, chatId, text, opts = {}) {
+  const typingEnabled = opts.typingEnabled !== false && TYPING_CFG.enabled !== false;
+  if (typingEnabled) {
+    await sock.sendPresenceUpdate('composing', chatId);
+    const secs = opts.typingSeconds ?? computeTypingSeconds(text);
+    await sleep(secs * 1000);
+    await sock.sendPresenceUpdate('paused', chatId);
+  }
+  return sock.sendMessage(chatId, { text });
 }
 
 let sock = null;
@@ -634,12 +725,20 @@ app.post('/send', async (req, res) => {
     return res.status(503).json({ error: 'Not connected to WhatsApp' });
   }
 
-  const { chatId, message, replyTo } = req.body;
+  const { chatId, message, replyTo, mark_read: markRead = false } = req.body;
   if (!chatId || !message) {
     return res.status(400).json({ error: 'chatId and message are required' });
   }
 
   try {
+    // mark_read: drain unread keys and mark them read before sending
+    if (markRead) {
+      const keys = drainUnreadKeysForChat(chatId);
+      if (keys.length > 0 && sock.readMessages) {
+        await sock.readMessages(keys);
+      }
+    }
+
     const chunks = splitLongMessage(formatOutgoingMessage(message));
     const messageIds = [];
     for (let i = 0; i < chunks.length; i += 1) {
@@ -723,12 +822,20 @@ app.post('/send-media', async (req, res) => {
     return res.status(503).json({ error: 'Not connected to WhatsApp' });
   }
 
-  const { chatId, filePath, mediaType, caption, fileName } = req.body;
+  const { chatId, filePath, mediaType, caption, fileName, mark_read: markRead = false } = req.body;
   if (!chatId || !filePath) {
     return res.status(400).json({ error: 'chatId and filePath are required' });
   }
 
   try {
+    // mark_read: drain unread keys and mark them read before sending
+    if (markRead) {
+      const keys = drainUnreadKeysForChat(chatId);
+      if (keys.length > 0 && sock.readMessages) {
+        await sock.readMessages(keys);
+      }
+    }
+
     if (!existsSync(filePath)) {
       return res.status(404).json({ error: `File not found: ${filePath}` });
     }
