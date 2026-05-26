@@ -244,3 +244,16 @@ test('formatOutgoingMessage with prefixOverride="[via bot] " uses custom prefix'
     '[via bot] hi',
   );
 });
+
+// --- /mark-read endpoint: source-level sanity ---
+
+test('bridge.js exposes a /mark-read endpoint', () => {
+  const src = readFileSync(BRIDGE_PATH, 'utf8');
+  // Endpoint declared.
+  assert.match(src, /app\.post\(['"]\/mark-read['"]/);
+  // Drains the unread keys via the existing helper.
+  assert.match(src, /drainUnreadKeysForChat\(chatId\)/);
+  // Calls sock.readMessages with the drained keys.
+  assert.match(src, /sock\.readMessages\(keys\)/);
+});
+

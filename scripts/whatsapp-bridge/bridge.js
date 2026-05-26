@@ -956,6 +956,35 @@ app.post('/typing', async (req, res) => {
   }
 });
 
+// Mark a chat as read without sending anything. Drains the per-chat
+// unread-keys queue (populated on every observed inbound) and calls
+// sock.readMessages so blue ticks land on the sender's side. Idempotent —
+// if there are no queued keys, this is a no-op and returns count=0.
+app.post('/mark-read', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected' });
+  }
+
+  const { chatId } = req.body;
+  if (!chatId) return res.status(400).json({ error: 'chatId required' });
+
+  try {
+    const keys = drainUnreadKeysForChat(chatId);
+    if (keys.length === 0) {
+      return res.json({ success: true, marked: 0 });
+    }
+    if (!sock.readMessages) {
+      // Older Baileys without readMessages support — silently no-op so the
+      // tool call doesn't surface as a failure to the agent.
+      return res.json({ success: true, marked: 0, note: 'readMessages unavailable' });
+    }
+    await sock.readMessages(keys);
+    res.json({ success: true, marked: keys.length });
+  } catch (err) {
+    res.status(500).json({ error: String(err) });
+  }
+});
+
 // Chat info
 app.get('/chat/:id', async (req, res) => {
   const chatId = req.params.id;
