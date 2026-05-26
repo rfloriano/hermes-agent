@@ -7,7 +7,7 @@ import path from 'node:path';
 // bridge.js is a module with side-effects (starts HTTP server) when run as
 // main. We import only the named exports we need. The server startup is guarded
 // by an import.meta.url check in bridge.js so importing it here is safe.
-import { OBSERVE_NON_SELF, parseObserveNonSelf, processIncoming } from './bridge.js';
+import { OBSERVE_NON_SELF, parseObserveNonSelf, processIncoming, recordHermesSend, markRecentHermesSendForChat } from './bridge.js';
 
 const BRIDGE_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), 'bridge.js');
 
@@ -102,4 +102,38 @@ test('self-chat reply path: fromMe DM in self-chat forwards without observe_only
   }, { mode: 'self-chat', observeNonSelf: true });
   assert.equal(result.action, 'forward');
   assert.notEqual(result.payload.observe_only, true);
+});
+
+// --- Task 3: hermes_origin tagging tests ---
+
+test('outbound sent via bridge is tagged hermes_origin on upsert', () => {
+  recordHermesSend('15550000001@s.whatsapp.net', 'HERMES-MSG-1');
+  const result = processIncoming({
+    key: { remoteJid: '15550000001@s.whatsapp.net', fromMe: true, id: 'HERMES-MSG-1' },
+    message: { conversation: 'reply from bot' },
+    messageTimestamp: 1716000050,
+  }, { mode: 'self-chat', observeNonSelf: true });
+  assert.equal(result.action, 'forward');
+  assert.equal(result.payload.hermes_origin, true);
+});
+
+test('outbound that does not match a recent hermes send is not tagged', () => {
+  const result = processIncoming({
+    key: { remoteJid: '15550000002@s.whatsapp.net', fromMe: true, id: 'PHONE-MSG-1' },
+    message: { conversation: 'typed manually from the phone' },
+    messageTimestamp: 1716000060,
+  }, { mode: 'self-chat', observeNonSelf: true });
+  // Forward (self-chat fromMe path), but hermes_origin should be falsy.
+  assert.equal(result.action, 'forward');
+  assert.notEqual(result.payload.hermes_origin, true);
+});
+
+test('fallback tags hermes_origin via recentlySent timestamp window', () => {
+  markRecentHermesSendForChat('15550000003@s.whatsapp.net', Date.now());
+  const result = processIncoming({
+    key: { remoteJid: '15550000003@s.whatsapp.net', fromMe: true, id: 'UNKNOWN-ID' },
+    message: { conversation: 'late ack' },
+    messageTimestamp: Math.floor(Date.now() / 1000),
+  }, { mode: 'self-chat', observeNonSelf: true });
+  assert.equal(result.payload.hermes_origin, true);
 });

@@ -207,6 +207,11 @@ export function processIncoming(msg, { mode, observeNonSelf = OBSERVE_NON_SELF }
   if (fromMe) {
     if (mode === 'self-chat' && !isGroup) {
       // The user's own message to themselves — process normally.
+      // Tag if the bridge originated this send so downstream hook handlers
+      // can distinguish bot replies from messages the user typed manually.
+      if (isHermesOrigin(chatId, msg.key.id)) {
+        payload.hermes_origin = true;
+      }
       return { action: 'forward', payload };
     }
     if (mode === 'self-chat' && isGroup) {
@@ -258,6 +263,62 @@ const MAX_QUEUE_SIZE = 100;
 // Track recently sent message IDs to prevent echo-back loops with media
 const recentlySentIds = new Set();
 const MAX_RECENT_IDS = 50;
+
+// --- Hermes-origin tagging (Task 3) ---
+// Time window (ms) within which a fromMe message is considered hermes-originated
+// if we don't have the exact message ID (fallback path).
+const RECENT_WINDOW_MS = 10_000;
+
+// Set of message IDs that Hermes sent via the HTTP /send endpoint.
+// Entries are removed after ~30 s so they don't accumulate indefinitely.
+const HERMES_SENT_IDS = new Set();
+
+// Map of chatId → timestamp (ms) of the last hermes send on that chat.
+const HERMES_RECENT_BY_CHAT = new Map();
+
+/**
+ * Record that Hermes sent a message with the given ID to the given chat.
+ * Called from the HTTP send endpoints after sock.sendMessage() returns.
+ */
+export function recordHermesSend(chatId, messageId) {
+  if (messageId) {
+    HERMES_SENT_IDS.add(messageId);
+    const timer = setTimeout(() => HERMES_SENT_IDS.delete(messageId), 30_000);
+    timer.unref?.();
+  }
+  if (chatId) {
+    HERMES_RECENT_BY_CHAT.set(chatId, Date.now());
+    const timer = setTimeout(() => {
+      // Only delete if the timestamp hasn't been refreshed
+      const ts = HERMES_RECENT_BY_CHAT.get(chatId);
+      if (ts !== undefined && Date.now() - ts >= 30_000) {
+        HERMES_RECENT_BY_CHAT.delete(chatId);
+      }
+    }, 30_000);
+    timer.unref?.();
+  }
+}
+
+/**
+ * Manually record a recent hermes send timestamp for a chat (used in tests /
+ * fallback path when message ID is unavailable).
+ */
+export function markRecentHermesSendForChat(chatId, tsMs) {
+  if (chatId) {
+    HERMES_RECENT_BY_CHAT.set(chatId, tsMs);
+  }
+}
+
+/**
+ * Returns true if the given message appears to have originated from Hermes.
+ * Uses either an exact message-ID match or a recency window fallback.
+ */
+function isHermesOrigin(chatId, messageId) {
+  if (messageId && HERMES_SENT_IDS.has(messageId)) return true;
+  const lastSent = HERMES_RECENT_BY_CHAT.get(chatId);
+  if (lastSent !== undefined && Date.now() - lastSent <= RECENT_WINDOW_MS) return true;
+  return false;
+}
 
 let sock = null;
 let connectionState = 'disconnected';
@@ -584,7 +645,10 @@ app.post('/send', async (req, res) => {
     for (let i = 0; i < chunks.length; i += 1) {
       const sent = await sendWithTimeout(chatId, { text: chunks[i] });
       trackSentMessageId(sent);
-      if (sent?.key?.id) messageIds.push(sent.key.id);
+      if (sent?.key?.id) {
+        messageIds.push(sent.key.id);
+        recordHermesSend(chatId, sent.key.id);
+      }
       if (chunks.length > 1 && i < chunks.length - 1) {
         await sleep(CHUNK_DELAY_MS);
       }
@@ -723,6 +787,7 @@ app.post('/send-media', async (req, res) => {
     const sent = await sendWithTimeout(chatId, msgPayload);
 
     trackSentMessageId(sent);
+    if (sent?.key?.id) recordHermesSend(chatId, sent.key.id);
 
     res.json({ success: true, messageId: sent?.key?.id });
   } catch (err) {
