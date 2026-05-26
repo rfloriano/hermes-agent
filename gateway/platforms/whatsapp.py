@@ -502,8 +502,23 @@ class WhatsAppAdapter(BasePlatformAdapter):
 
     def _engagement_active_for_chat(self, chat_id: str) -> bool:
         """True if there is a non-expired engagement window for chat_id."""
-        # Stub: Task 10 replaces this with real engagements.json logic.
-        return False
+        if not chat_id:
+            return False
+        path = self._engagements_path()
+        if not path.exists():
+            return False
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            return False
+        window = data.get("windows", {}).get(chat_id)
+        if not window:
+            return False
+        try:
+            expires = datetime.fromisoformat(window["expires_at"])
+        except (KeyError, ValueError):
+            return False
+        return expires > datetime.now(timezone.utc)
 
     # ------------------------------------------------------------------
     # Unified inbound-event handler (called from poll loop)
