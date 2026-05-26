@@ -281,8 +281,46 @@ class WhatsAppAdapter(BasePlatformAdapter):
         # Optional hook registry injected by run.py after construction.
         self._hook_registry = None
 
-    def _effective_reply_prefix(self) -> str:
-        """Return the prefix the Node bridge will add in self-chat mode."""
+    def _engagement_record(self, chat_id: str) -> Optional[Dict[str, Any]]:
+        """Return the raw engagement window dict for chat_id, or None."""
+        path = self._engagements_path()
+        if not path.exists():
+            return None
+        try:
+            data = json.loads(path.read_text())
+        except Exception:
+            return None
+        return data.get("windows", {}).get(chat_id)
+
+    def _effective_reply_prefix(self, chat_id: Optional[str] = None) -> str:
+        """Resolve outgoing reply prefix for a given target chat.
+
+        Resolution order:
+        1. Per-engagement window reply_prefix override (if set and non-None).
+        2. Engagement-default override — env WHATSAPP_ENGAGEMENT_REPLY_PREFIX
+           or config engagement_reply_prefix (only when chat is engaged).
+           Falls through to empty string when engaged but no override.
+        3. General self-chat prefix (existing behaviour, no engagement).
+        """
+        # 1. Per-engagement override.
+        if chat_id:
+            engagement = self._engagement_record(chat_id)
+            if engagement is not None and engagement.get("reply_prefix") is not None:
+                raw = engagement["reply_prefix"]
+                return raw.replace("\\n", "\n") if raw else ""
+
+        # 2. Engagement default override (active only if chat is engaged).
+        if chat_id and self._engagement_active_for_chat(chat_id):
+            cfg = self.config.extra.get("engagement_reply_prefix")
+            if cfg is not None:
+                return cfg.replace("\\n", "\n")
+            env = os.getenv("WHATSAPP_ENGAGEMENT_REPLY_PREFIX")
+            if env is not None:
+                return env.replace("\\n", "\n")
+            # Engaged but no explicit override — use empty prefix.
+            return ""
+
+        # 3. General reply prefix (existing behaviour).
         whatsapp_mode = os.getenv("WHATSAPP_MODE", "self-chat")
         if whatsapp_mode != "self-chat":
             return ""
