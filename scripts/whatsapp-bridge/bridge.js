@@ -354,10 +354,6 @@ export function drainUnreadKeysForChat(chatId) {
   return keys;
 }
 
-// --- Task 5: Typing / presence helpers (implemented below after TYPING_CFG) ---
-// Forward declaration — full implementation follows after module-level constants.
-// computeTypingSeconds is exported at definition site below.
-
 /**
  * Returns true if the given message appears to have originated from Hermes.
  * Uses either an exact message-ID match or a recency window fallback.
@@ -393,11 +389,12 @@ export function computeTypingSeconds(text, cfg = TYPING_CFG) {
 }
 
 /**
- * Send composing presence, wait, send paused, then call sock.sendMessage.
+ * Send composing presence, wait, send paused, then invoke the provided send
+ * function (defaults to sock.sendMessage).
  * @param {object} sock - Baileys socket
  * @param {string} chatId
  * @param {string} text
- * @param {{ typingEnabled?: boolean, typingSeconds?: number }} [opts]
+ * @param {{ typingEnabled?: boolean, typingSeconds?: number, sendFn?: Function }} [opts]
  * @returns {Promise}
  */
 async function performTypingAndSend(sock, chatId, text, opts = {}) {
@@ -408,7 +405,8 @@ async function performTypingAndSend(sock, chatId, text, opts = {}) {
     await sleep(secs * 1000);
     await sock.sendPresenceUpdate('paused', chatId);
   }
-  return sock.sendMessage(chatId, { text });
+  const sendFn = opts.sendFn ?? ((cid, payload) => sock.sendMessage(cid, payload));
+  return sendFn(chatId, { text });
 }
 
 let sock = null;
@@ -725,7 +723,14 @@ app.post('/send', async (req, res) => {
     return res.status(503).json({ error: 'Not connected to WhatsApp' });
   }
 
-  const { chatId, message, replyTo, mark_read: markRead = false } = req.body;
+  const {
+    chatId,
+    message,
+    replyTo,
+    mark_read: markRead = false,
+    typing_enabled: typingEnabled = true,
+    typing_seconds: typingSeconds,
+  } = req.body;
   if (!chatId || !message) {
     return res.status(400).json({ error: 'chatId and message are required' });
   }
@@ -742,7 +747,14 @@ app.post('/send', async (req, res) => {
     const chunks = splitLongMessage(formatOutgoingMessage(message));
     const messageIds = [];
     for (let i = 0; i < chunks.length; i += 1) {
-      const sent = await sendWithTimeout(chatId, { text: chunks[i] });
+      // Typing indicator only before the first chunk; subsequent chunks send immediately.
+      const sent = i === 0
+        ? await performTypingAndSend(sock, chatId, chunks[i], {
+            typingEnabled,
+            ...(typingSeconds !== undefined ? { typingSeconds } : {}),
+            sendFn: (cid, payload) => sendWithTimeout(cid, payload),
+          })
+        : await sendWithTimeout(chatId, { text: chunks[i] });
       trackSentMessageId(sent);
       if (sent?.key?.id) {
         messageIds.push(sent.key.id);
@@ -822,7 +834,16 @@ app.post('/send-media', async (req, res) => {
     return res.status(503).json({ error: 'Not connected to WhatsApp' });
   }
 
-  const { chatId, filePath, mediaType, caption, fileName, mark_read: markRead = false } = req.body;
+  const {
+    chatId,
+    filePath,
+    mediaType,
+    caption,
+    fileName,
+    mark_read: markRead = false,
+    typing_enabled: typingEnabled = true,
+    typing_seconds: typingSeconds,
+  } = req.body;
   if (!chatId || !filePath) {
     return res.status(400).json({ error: 'chatId and filePath are required' });
   }
@@ -834,6 +855,15 @@ app.post('/send-media', async (req, res) => {
       if (keys.length > 0 && sock.readMessages) {
         await sock.readMessages(keys);
       }
+    }
+
+    // typing indicator before media send (uses caption text for duration calc)
+    const typingEnabled_ = typingEnabled !== false && TYPING_CFG.enabled !== false;
+    if (typingEnabled_) {
+      await sock.sendPresenceUpdate('composing', chatId);
+      const secs = typingSeconds ?? computeTypingSeconds(caption || '');
+      await sleep(secs * 1000);
+      await sock.sendPresenceUpdate('paused', chatId);
     }
 
     if (!existsSync(filePath)) {

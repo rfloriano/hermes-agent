@@ -190,3 +190,23 @@ test('outbound (fromMe) does NOT append to unread queue', () => {
   const keys = getUnreadKeysForChat(chatId);
   assert.equal(keys.length, 0);
 });
+
+// --- Task 5: computeTypingSeconds ---
+
+test('typing duration scales with message length within bounds', () => {
+  assert.equal(computeTypingSeconds('hi'),  1);            // floor (2/15 < 1)
+  assert.equal(computeTypingSeconds('a'.repeat(75)), 5);   // 75/15 = 5
+  assert.equal(computeTypingSeconds('a'.repeat(300)), 8);  // ceiling
+});
+
+test('computeTypingSeconds respects custom config', () => {
+  assert.equal(
+    computeTypingSeconds('a'.repeat(40), { charsPerSecond: 10, min: 2, max: 5 }),
+    4,
+  );
+});
+
+test('computeTypingSeconds handles empty/null gracefully', () => {
+  assert.equal(computeTypingSeconds(''), 1);    // floor
+  assert.equal(computeTypingSeconds(null), 1);  // floor
+});
