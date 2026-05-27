@@ -23,7 +23,7 @@ import express from 'express';
 import { Boom } from '@hapi/boom';
 import pino from 'pino';
 import path from 'path';
-import { mkdirSync, readFileSync, writeFileSync, existsSync, readdirSync, unlinkSync } from 'fs';
+import { mkdirSync, readFileSync, writeFileSync, existsSync, readdirSync, unlinkSync, appendFileSync } from 'fs';
 import { randomBytes } from 'crypto';
 import { execSync } from 'child_process';
 import { tmpdir } from 'os';
@@ -678,6 +678,34 @@ async function startSocket() {
       }
     }
   });
+
+  // Bulk-sync listener: receives WhatsApp's initial history dump (only
+  // delivered when paired as a Desktop-platform device with syncFullHistory
+  // enabled). Writes messages straight to the archive — bypasses the
+  // live-message queue, which would overflow on a multi-thousand dump.
+  // Skips events tagged with peerDataRequestSessionId — those are /backfill
+  // responses already handled by waitForHistoryEvent.
+  sock.ev.on('messaging-history.set', ({ messages, isLatest, peerDataRequestSessionId }) => {
+    if (peerDataRequestSessionId) return;
+    if (!Array.isArray(messages) || messages.length === 0) return;
+
+    let written = 0;
+    let skipped = 0;
+    for (const msg of messages) {
+      if (!msg || !msg.message) continue;
+      const record = buildBackfillRecord(msg);
+      if (!record) continue;
+      record.observe_only = true; // historical — don't engage the agent
+      if (writeArchiveRecord(record)) written++; else skipped++;
+    }
+    console.log(JSON.stringify({
+      event: 'history_sync',
+      written,
+      skipped_dup: skipped,
+      total: messages.length,
+      isLatest: !!isLatest,
+    }));
+  });
 }
 
 // HTTP server
@@ -1000,6 +1028,82 @@ app.post('/mark-read', async (req, res) => {
 //   { success: false, error: "<message>", partial: [...] }
 const BACKFILL_TIMEOUT_MS = parseInt(process.env.WHATSAPP_BACKFILL_TIMEOUT_MS || '30000', 10);
 const BACKFILL_EMPTY_RETRY = 1; // retry once if first batch is empty
+
+// ------------------------------------------------------------------
+// Direct-archive writes (used by the messaging-history.set listener
+// to persist initial-sync messages without going through Python).
+// Format matches extensions/whatsapp-watcher/archive.py exactly so
+// either writer can append to the same JSONL files.
+// ------------------------------------------------------------------
+const HERMES_HOME = process.env.HERMES_HOME || path.join(process.env.HOME || '~', '.hermes');
+const WA_ARCHIVE_DIR = path.join(HERMES_HOME, 'whatsapp', 'archive');
+const _archiveKnownIds = new Map(); // chatId -> Set<message_id>
+
+function _sanitizeChatId(chatId) {
+  return chatId.replace(/[^A-Za-z0-9._@-]/g, '_');
+}
+
+function _epochToIso(ts) {
+  // Match Python's datetime.fromtimestamp(ts, timezone.utc).isoformat():
+  // 2026-05-26T17:43:09+00:00 (no fractional seconds, +00:00 suffix).
+  if (typeof ts !== 'number' || !Number.isFinite(ts)) {
+    return new Date().toISOString().replace(/\.\d{3}Z$/, '+00:00');
+  }
+  return new Date(ts * 1000).toISOString().replace(/\.\d{3}Z$/, '+00:00');
+}
+
+function _loadKnownIds(chatId) {
+  let ids = _archiveKnownIds.get(chatId);
+  if (ids) return ids;
+  ids = new Set();
+  const p = path.join(WA_ARCHIVE_DIR, `${_sanitizeChatId(chatId)}.jsonl`);
+  if (existsSync(p)) {
+    try {
+      const content = readFileSync(p, 'utf-8');
+      for (const line of content.split('\n')) {
+        if (!line) continue;
+        try {
+          const rec = JSON.parse(line);
+          if (rec.message_id) ids.add(rec.message_id);
+        } catch {}
+      }
+    } catch {}
+  }
+  _archiveKnownIds.set(chatId, ids);
+  return ids;
+}
+
+function writeArchiveRecord(rec) {
+  // Returns true if written, false if deduped or invalid.
+  const chatId = rec.chatId;
+  if (!chatId || !rec.messageId) return false;
+  const ids = _loadKnownIds(chatId);
+  if (ids.has(rec.messageId)) return false;
+  mkdirSync(WA_ARCHIVE_DIR, { recursive: true });
+  const filePath = path.join(WA_ARCHIVE_DIR, `${_sanitizeChatId(chatId)}.jsonl`);
+  const out = {
+    ts: _epochToIso(rec.timestamp),
+    direction: rec.fromMe ? 'out' : 'in',
+    chat_id: chatId,
+    is_group: !!rec.isGroup,
+    sender_id: rec.senderId,
+    sender_name: rec.senderName || '',
+    sender_e164: rec.sender_e164 || null,
+    message_id: rec.messageId,
+    kind: rec.kind || 'text',
+    body: rec.body || '',
+    media_ref: rec.media_ref || null,
+    hermes_origin: !!rec.hermes_origin,
+    observe_only: !!rec.observe_only,
+    reply_to: null,
+    edited: false,
+    original_message_id: null,
+    deleted_by: null,
+  };
+  appendFileSync(filePath, JSON.stringify(out) + '\n', 'utf-8');
+  ids.add(rec.messageId);
+  return true;
+}
 
 /**
  * Build a message payload identical in shape to what processIncoming / the
