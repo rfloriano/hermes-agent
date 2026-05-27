@@ -1220,6 +1220,7 @@ app.post('/backfill', async (req, res) => {
     count = 500,
     oldest_message_id: oldestMsgId,
     oldest_timestamp: oldestTs,
+    oldest_from_me: oldestFromMe = false,
   } = req.body || {};
 
   if (!chatId) {
@@ -1250,10 +1251,13 @@ app.post('/backfill', async (req, res) => {
     });
   }
 
-  // Build the anchor key from caller-supplied ids.
+  // Build the anchor key from caller-supplied ids. fromMe must match the
+  // server-side message's actual sender; if the anchor was a message you
+  // sent, passing fromMe:false here silently returns empty (the key won't
+  // resolve to a real message on WhatsApp's side).
   let anchorKey = {
     remoteJid: chatId,
-    fromMe: false,
+    fromMe: !!oldestFromMe,
     id: oldestMsgId,
   };
   let anchorTs = oldestTs ? Number(oldestTs) : Math.floor(Date.now() / 1000);
