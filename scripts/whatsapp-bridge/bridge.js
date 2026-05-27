@@ -425,8 +425,8 @@ async function startSocket() {
     auth: state,
     logger,
     printQRInTerminal: false,
-    browser: ['Hermes Agent', 'Chrome', '120.0'],
-    syncFullHistory: false,
+    browser: ['Hermes Agent', 'Desktop', '120.0'],
+    syncFullHistory: true,
     markOnlineOnConnect: false,
     // Required for Baileys 7.x: without this, incoming messages that need
     // E2EE session re-establishment are silently dropped (msg.message === null)
