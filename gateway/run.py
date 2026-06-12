@@ -4860,8 +4860,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             adapter.set_session_store(self.session_store)
             adapter.set_busy_session_handler(self._handle_active_session_busy_message)
             adapter.set_topic_recovery_fn(self._recover_telegram_topic_thread_id)
+            if hasattr(adapter, "set_hook_registry"):
+                adapter.set_hook_registry(self.hooks)
             adapter._busy_text_mode = self._busy_text_mode
-            
+
             # Try to connect
             logger.info("Connecting to %s...", platform.value)
             self._update_platform_runtime_status(
@@ -5596,6 +5598,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     adapter.set_session_store(self.session_store)
                     adapter.set_busy_session_handler(self._handle_active_session_busy_message)
                     adapter.set_topic_recovery_fn(self._recover_telegram_topic_thread_id)
+                    if hasattr(adapter, "set_hook_registry"):
+                        adapter.set_hook_registry(self.hooks)
                     adapter._busy_text_mode = self._busy_text_mode
 
                     success = await self._connect_adapter_with_timeout(adapter, platform)
@@ -14268,7 +14272,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _history_media_paths: set = set()
             for _hm in agent_history:
                 if _hm.get("role") in {"tool", "function"}:
-                    _hc = _hm.get("content", "")
+                    # NB: dict.get(k, default) returns default only when k is
+                    # missing — explicit None values fall through, so we'd
+                    # crash on `"MEDIA:" in None`. Use `or ""` to coerce.
+                    _hc = _hm.get("content") or ""
                     if "MEDIA:" in _hc:
                         _TOOL_MEDIA_RE = re.compile(
                             r'MEDIA:((?:[A-Za-z]:[/\\]|/|~\/)\S+\.(?:png|jpe?g|gif|webp|'
