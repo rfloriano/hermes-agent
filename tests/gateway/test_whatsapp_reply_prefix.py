@@ -117,3 +117,59 @@ class TestConfigVersionCoverage:
         """_config_version must be >= the highest ENV_VARS_BY_VERSION key."""
         from hermes_cli.config import DEFAULT_CONFIG, ENV_VARS_BY_VERSION
         assert DEFAULT_CONFIG["_config_version"] >= max(ENV_VARS_BY_VERSION)
+
+
+# ---------------------------------------------------------------------------
+# Engagement-aware reply prefix resolution (Task 11)
+# ---------------------------------------------------------------------------
+
+import json
+from datetime import datetime, timezone, timedelta
+from plugins.platforms.whatsapp.adapter import WhatsAppAdapter
+
+
+def _seed_engagement(tmp_path, chat_id, reply_prefix=None):
+    (tmp_path / "whatsapp").mkdir(parents=True, exist_ok=True)
+    future = (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat()
+    (tmp_path / "whatsapp" / "engagements.json").write_text(json.dumps({
+        "version": 1,
+        "windows": {
+            chat_id: {
+                "chat_id": chat_id, "expires_at": future,
+                "silence_threshold_seconds": 180, "reply_prefix": reply_prefix
+            }
+        },
+    }))
+
+
+def test_engagement_reply_prefix_empty_by_default(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _seed_engagement(tmp_path, "ENGAGED", reply_prefix=None)
+    adapter = WhatsAppAdapter(PlatformConfig(extra={}))
+    assert adapter._effective_reply_prefix("ENGAGED") == ""
+    # Non-engaged chat in self-chat mode keeps the default agent prefix.
+    assert adapter._effective_reply_prefix("OTHER").startswith("⚕")
+
+
+def test_engagement_per_window_reply_prefix_wins(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _seed_engagement(tmp_path, "ENGAGED", reply_prefix="🤖 ")
+    adapter = WhatsAppAdapter(PlatformConfig(extra={}))
+    assert adapter._effective_reply_prefix("ENGAGED") == "🤖 "
+
+
+def test_engagement_global_env_override(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("WHATSAPP_ENGAGEMENT_REPLY_PREFIX", "[via bot] ")
+    _seed_engagement(tmp_path, "ENGAGED", reply_prefix=None)
+    adapter = WhatsAppAdapter(PlatformConfig(extra={}))
+    assert adapter._effective_reply_prefix("ENGAGED") == "[via bot] "
+
+
+def test_general_reply_prefix_unchanged_for_non_engaged_chats(tmp_path, monkeypatch):
+    """Existing behavior preserved: in self-chat mode without engagement,
+    DEFAULT_REPLY_PREFIX still applies."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    adapter = WhatsAppAdapter(PlatformConfig(extra={}))
+    prefix = adapter._effective_reply_prefix("SOME_CHAT_ID")
+    assert prefix.startswith("⚕")
