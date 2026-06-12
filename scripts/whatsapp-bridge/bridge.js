@@ -24,11 +24,11 @@ import express from 'express';
 import { Boom } from '@hapi/boom';
 import pino from 'pino';
 import path from 'path';
-import { mkdirSync, readFileSync, existsSync, readdirSync, unlinkSync } from 'fs';
-import { fileURLToPath } from 'url';
+import { mkdirSync, readFileSync, writeFileSync, existsSync, readdirSync, unlinkSync, appendFileSync } from 'fs';
 import { randomBytes, createHash } from 'crypto';
 import { execFileSync } from 'child_process';
 import { tmpdir } from 'os';
+import { fileURLToPath } from 'url';
 import qrcode from 'qrcode-terminal';
 import { matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
 import { createOutboundIdTracker } from './outbound_ids.js';
@@ -110,6 +110,12 @@ const PAIR_ONLY = args.includes('--pair-only');
 const PAIR_JSON = args.includes('--pair-json');
 const WHATSAPP_MODE = getArg('mode', process.env.WHATSAPP_MODE || 'self-chat'); // "bot" or "self-chat"
 const WHATSAPP_DM_POLICY = String(process.env.WHATSAPP_DM_POLICY || 'open').trim().toLowerCase();
+export function parseObserveNonSelf(val) {
+  return (val || 'false').toString().toLowerCase() === 'true';
+}
+const OBSERVE_NON_SELF =
+  parseObserveNonSelf(getArg('observe-non-self', process.env.WHATSAPP_OBSERVE_NON_SELF || 'false'));
+export { OBSERVE_NON_SELF };
 const ALLOWED_USERS = parseAllowedUsers(process.env.WHATSAPP_ALLOWED_USERS || '');
 const DEFAULT_REPLY_PREFIX = '⚕ *Hermes Agent*\n────────────\n';
 const REPLY_PREFIX = process.env.WHATSAPP_REPLY_PREFIX === undefined
@@ -154,11 +160,15 @@ function sendWithTimeout(chatId, payload, options = {}, timeoutMs = SEND_TIMEOUT
   );
 }
 
-function formatOutgoingMessage(message) {
+export function formatOutgoingMessage(message, opts = {}, mode = WHATSAPP_MODE) {
   // In bot mode, messages come from a different number so the prefix is
   // redundant — the sender identity is already clear.  Only prepend in
   // self-chat mode where bot and user share the same number.
-  if (WHATSAPP_MODE !== 'self-chat') return message;
+  if (mode !== 'self-chat') return message;
+  // If caller provided a prefix_override (even empty string), use it verbatim.
+  if ('prefixOverride' in opts) {
+    return opts.prefixOverride ? `${opts.prefixOverride}${message}` : message;
+  }
   return REPLY_PREFIX ? `${REPLY_PREFIX}${message}` : message;
 }
 
@@ -243,6 +253,99 @@ function getContextInfo(messageContent) {
     }
   }
   return {};
+}
+
+/**
+ * Synchronously extract the text body from a message (no media download).
+ * Returns '' if the message has no extractable text.
+ */
+function extractText(msg) {
+  const messageContent = getMessageContent(msg);
+  if (messageContent.conversation) return messageContent.conversation;
+  if (messageContent.extendedTextMessage?.text) return messageContent.extendedTextMessage.text;
+  if (messageContent.imageMessage?.caption) return messageContent.imageMessage.caption;
+  if (messageContent.videoMessage?.caption) return messageContent.videoMessage.caption;
+  if (messageContent.documentMessage?.caption) return messageContent.documentMessage.caption;
+  return '';
+}
+
+/**
+ * Pure routing function: given a raw Baileys message and runtime options,
+ * returns a decision object:
+ *   { action: 'ignore', reason: string }
+ *   { action: 'forward', payload: object }
+ *
+ * NOTE: this function does NOT perform the isSelfChat number check (which
+ * requires sock.user), allowlist checks, echo-back dedup, or media download.
+ * Those remain in the messages.upsert handler.
+ *
+ * @param {object} msg - Raw Baileys message
+ * @param {object} opts
+ * @param {string} opts.mode - 'self-chat' | 'bot'
+ * @param {boolean} [opts.observeNonSelf] - defaults to module-level OBSERVE_NON_SELF
+ */
+export function processIncoming(msg, { mode, observeNonSelf = OBSERVE_NON_SELF }) {
+  const chatId = msg.key.remoteJid;
+  const fromMe = !!msg.key.fromMe;
+  const isGroup = chatId.endsWith('@g.us');
+  const isBroadcast = chatId.includes('status') || chatId.endsWith('@broadcast');
+
+  if (isBroadcast) return { action: 'ignore', reason: 'broadcast' };
+
+  const senderId = msg.key.participant || msg.key.remoteJid;
+  const body = extractText(msg);
+  const payload = {
+    chatId,
+    fromMe,
+    isGroup,
+    senderId,
+    senderName: msg.pushName || '',
+    messageId: msg.key.id,
+    timestamp: msg.messageTimestamp,
+    body,
+    media: null,
+  };
+
+  if (fromMe) {
+    if (mode === 'self-chat' && !isGroup) {
+      // The user's own message to themselves — process normally.
+      // Tag if the bridge originated this send so downstream hook handlers
+      // can distinguish bot replies from messages the user typed manually.
+      if (isHermesOrigin(chatId, msg.key.id)) {
+        payload.hermes_origin = true;
+      }
+      return { action: 'forward', payload };
+    }
+    if (mode === 'self-chat' && isGroup) {
+      if (observeNonSelf) {
+        return { action: 'forward', payload: { ...payload, observe_only: true } };
+      }
+      return { action: 'ignore', reason: 'self_chat_skip_own_group' };
+    }
+    // Bot mode: fromMe messages are echo-backs of our own replies — skip.
+    return { action: 'ignore', reason: 'bot_mode_echo' };
+  }
+
+  // !fromMe path
+  if (mode === 'self-chat') {
+    if (observeNonSelf) {
+      appendUnread(chatId, {
+        remoteJid: chatId,
+        id: msg.key.id,
+        ...(msg.key.participant ? { participant: msg.key.participant } : {}),
+      });
+      return { action: 'forward', payload: { ...payload, observe_only: true } };
+    }
+    return { action: 'ignore', reason: 'self_chat_mode_rejects_non_self' };
+  }
+
+  // Bot mode: forward for allowlist check in the handler.
+  appendUnread(chatId, {
+    remoteJid: chatId,
+    id: msg.key.id,
+    ...(msg.key.participant ? { participant: msg.key.participant } : {}),
+  });
+  return { action: 'forward', payload };
 }
 
 mkdirSync(SESSION_DIR, { recursive: true });
@@ -383,6 +486,148 @@ function rememberSentId(id) {
   recentlySentIds.remember(id);
 }
 
+// --- Hermes-origin tagging (Task 3) ---
+// Time window (ms) within which a fromMe message is considered hermes-originated
+// if we don't have the exact message ID (fallback path).
+const RECENT_WINDOW_MS = 10_000;
+
+// Set of message IDs that Hermes sent via the HTTP /send endpoint.
+// Entries are removed after ~30 s so they don't accumulate indefinitely.
+const HERMES_SENT_IDS = new Set();
+
+// Map of chatId → timestamp (ms) of the last hermes send on that chat.
+const HERMES_RECENT_BY_CHAT = new Map();
+
+/**
+ * Record that Hermes sent a message with the given ID to the given chat.
+ * Called from the HTTP send endpoints after sock.sendMessage() returns.
+ */
+export function recordHermesSend(chatId, messageId) {
+  if (messageId) {
+    HERMES_SENT_IDS.add(messageId);
+    const timer = setTimeout(() => HERMES_SENT_IDS.delete(messageId), 30_000);
+    timer.unref?.();
+  }
+  if (chatId) {
+    HERMES_RECENT_BY_CHAT.set(chatId, Date.now());
+    const timer = setTimeout(() => {
+      // Only delete if the timestamp hasn't been refreshed
+      const ts = HERMES_RECENT_BY_CHAT.get(chatId);
+      if (ts !== undefined && Date.now() - ts >= 30_000) {
+        HERMES_RECENT_BY_CHAT.delete(chatId);
+      }
+    }, 30_000);
+    timer.unref?.();
+  }
+}
+
+/**
+ * Manually record a recent hermes send timestamp for a chat (used in tests /
+ * fallback path when message ID is unavailable).
+ */
+export function markRecentHermesSendForChat(chatId, tsMs) {
+  if (chatId) {
+    HERMES_RECENT_BY_CHAT.set(chatId, tsMs);
+  }
+}
+
+// --- Task 4: Per-chat unread-keys queue ---
+// Tracks message keys for !fromMe messages that have been forwarded but not yet
+// marked read. Drained by the HTTP send endpoints when mark_read=true.
+const UNREAD_KEYS = new Map();
+
+/**
+ * Append a message key to the per-chat unread queue.
+ * @param {string} chatId
+ * @param {{ remoteJid: string, id: string, participant?: string }} key
+ */
+function appendUnread(chatId, key) {
+  if (!UNREAD_KEYS.has(chatId)) UNREAD_KEYS.set(chatId, []);
+  UNREAD_KEYS.get(chatId).push(key);
+}
+
+/**
+ * Return a copy of the unread keys for the given chat (non-destructive).
+ * @param {string} chatId
+ * @returns {Array}
+ */
+export function getUnreadKeysForChat(chatId) {
+  return [...(UNREAD_KEYS.get(chatId) || [])];
+}
+
+/**
+ * Drain (remove and return) all unread keys for the given chat.
+ * @param {string} chatId
+ * @returns {Array}
+ */
+export function drainUnreadKeysForChat(chatId) {
+  const keys = UNREAD_KEYS.get(chatId) || [];
+  UNREAD_KEYS.delete(chatId);
+  return keys;
+}
+
+/**
+ * Returns true if the given message appears to have originated from Hermes.
+ * Uses either an exact message-ID match or a recency window fallback.
+ */
+function isHermesOrigin(chatId, messageId) {
+  if (messageId && HERMES_SENT_IDS.has(messageId)) return true;
+  const lastSent = HERMES_RECENT_BY_CHAT.get(chatId);
+  if (lastSent !== undefined && Date.now() - lastSent <= RECENT_WINDOW_MS) return true;
+  return false;
+}
+
+// --- Task 5: Typing config and helpers ---
+const TYPING_CFG = {
+  enabled: (process.env.WHATSAPP_TYPING_ENABLED ?? 'true').toLowerCase() === 'true',
+  charsPerSecond: Number(process.env.WHATSAPP_TYPING_CPS ?? 15),
+  min: Number(process.env.WHATSAPP_TYPING_MIN_SECONDS ?? 1),
+  max: Number(process.env.WHATSAPP_TYPING_MAX_SECONDS ?? 8),
+};
+
+/**
+ * Compute how many seconds to show the typing indicator before sending.
+ * Scales linearly with message length, clamped to [cfg.min, cfg.max].
+ * @param {string|null} text
+ * @param {{ charsPerSecond?: number, min?: number, max?: number }} [cfg]
+ * @returns {number}
+ */
+export function computeTypingSeconds(text, cfg = TYPING_CFG) {
+  const len = (text || '').length;
+  const cps = cfg.charsPerSecond ?? TYPING_CFG.charsPerSecond;
+  const min = cfg.min ?? TYPING_CFG.min;
+  const max = cfg.max ?? TYPING_CFG.max;
+  return Math.max(min, Math.min(max, Math.round(len / cps)));
+}
+
+/**
+ * Send composing presence, wait, send paused, then invoke the provided send
+ * function (defaults to sock.sendMessage).
+ * @param {object} sock - Baileys socket
+ * @param {string} chatId
+ * @param {string} text
+ * @param {{ typingEnabled?: boolean, typingSeconds?: number, sendFn?: Function }} [opts]
+ * @returns {Promise}
+ */
+async function performTypingAndSend(sock, chatId, text, opts = {}) {
+  const typingEnabled = opts.typingEnabled !== false && TYPING_CFG.enabled !== false;
+  if (typingEnabled) {
+    await sock.sendPresenceUpdate('composing', chatId);
+    const secs = opts.typingSeconds ?? computeTypingSeconds(text);
+    await sleep(secs * 1000);
+    await sock.sendPresenceUpdate('paused', chatId);
+  }
+  // `text` is used only for the typing-duration calc. The actual payload sent
+  // defaults to a plain text message, but callers that need a richer payload
+  // (e.g. a quoted reply built via buildTextSendPayload) pass opts.payload plus
+  // opts.sendOptions so the Baileys send options — quoted metadata lives there,
+  // not inside the content — ride through to sock.sendMessage / sendWithTimeout.
+  const content = opts.payload ?? { text };
+  const sendOptions = opts.sendOptions ?? {};
+  const sendFn = opts.sendFn ?? ((cid, payloadArg, optsArg) => sock.sendMessage(cid, payloadArg, optsArg));
+  return sendFn(chatId, content, sendOptions);
+}
+
 let sock = null;
 let connectionState = 'disconnected';
 
@@ -402,8 +647,8 @@ async function startSocket() {
     auth: state,
     logger,
     printQRInTerminal: false,
-    browser: ['Hermes Agent', 'Chrome', '120.0'],
-    syncFullHistory: false,
+    browser: ['Hermes Agent', 'Desktop', '120.0'],
+    syncFullHistory: true,
     markOnlineOnConnect: false,
     // Required for Baileys 7.x: without this, incoming messages that need
     // E2EE session re-establishment are silently dropped (msg.message === null)
@@ -550,19 +795,40 @@ async function startSocket() {
         messageKeys: Object.keys(msg.message || {}),
       });
 
+      // Watcher OBSERVE mode: when WHATSAPP_OBSERVE_NON_SELF is enabled,
+      // messages that would normally be dropped (own group posts, non-self
+      // DMs in self-chat mode) are instead forwarded tagged observe_only:true
+      // so the Python watcher can archive them and drive engagement windows
+      // WITHOUT engaging the agent. Declared here so it's in scope at
+      // event-build time below. (See processIncoming for the pure form of
+      // this eligibility logic — kept exported + unit-tested.)
+      let observeOnly = false;
+
       // Handle fromMe messages based on mode
       let fromOwner = false;
       if (msg.key.fromMe) {
-        if (isGroup || chatId.includes('status')) {
+        if (chatId.includes('status')) {
+          // Status broadcasts are never observed or forwarded.
           emitDebugEvent({
             stage: 'ignored',
-            reason: isGroup ? 'from_me_group' : 'from_me_status',
+            reason: 'from_me_status',
             chatId: redactWhatsAppId(chatId),
           });
           continue;
-        }
-
-        if (WHATSAPP_MODE === 'bot') {
+        } else if (isGroup) {
+          // Own group posts: observe (watcher) when enabled, otherwise drop
+          // as before.
+          if (OBSERVE_NON_SELF) {
+            observeOnly = true;
+          } else {
+            emitDebugEvent({
+              stage: 'ignored',
+              reason: 'from_me_group',
+              chatId: redactWhatsAppId(chatId),
+            });
+            continue;
+          }
+        } else if (WHATSAPP_MODE === 'bot') {
           // Bot mode: separate bot number. fromMe inbound is either
           //   (a) an echo of our own /send (recentlySentIds will catch it), or
           //   (b) a message the owner typed from their own phone using the
@@ -628,29 +894,51 @@ async function startSocket() {
       // Self-chat mode only responds to the user's own messages to
       // themselves — stranger DMs / group pings must never reach the
       // Python gateway, otherwise a pairing-code reply fires in response
-      // to arbitrary incoming messages (#8389).
+      // to arbitrary incoming messages (#8389). Watcher OBSERVE mode is the
+      // one exception: it archives them tagged observe_only without engaging.
       if (!msg.key.fromMe) {
         if (WHATSAPP_MODE === 'self-chat') {
-          try {
-            console.log(JSON.stringify({
-              event: 'ignored',
-              reason: 'self_chat_mode_rejects_non_self',
-              chatId,
-              senderId,
-            }));
-          } catch {}
-          continue;
-        }
-        if (WHATSAPP_DM_POLICY !== 'pairing' && !matchesAllowedUser(senderId, ALLOWED_USERS, SESSION_DIR)) {
-          try {
-            console.log(JSON.stringify({
-              event: 'ignored',
-              reason: 'allowlist_mismatch',
-              chatId,
-              senderId,
-            }));
-          } catch {}
-          continue;
+          if (OBSERVE_NON_SELF) {
+            // Watcher: record the inbound in the per-chat unread queue (so
+            // /mark-read and /send mark_read can blue-tick it later) and
+            // forward it tagged observe_only.
+            appendUnread(chatId, {
+              remoteJid: chatId,
+              id: msg.key.id,
+              ...(msg.key.participant ? { participant: msg.key.participant } : {}),
+            });
+            observeOnly = true;
+          } else {
+            try {
+              console.log(JSON.stringify({
+                event: 'ignored',
+                reason: 'self_chat_mode_rejects_non_self',
+                chatId,
+                senderId,
+              }));
+            } catch {}
+            continue;
+          }
+        } else {
+          // Bot mode: record the inbound in the per-chat unread queue before
+          // the allowlist/pairing gate so /mark-read and /send mark_read can
+          // drain it later (mirrors the pre-gate appendUnread in processIncoming).
+          appendUnread(chatId, {
+            remoteJid: chatId,
+            id: msg.key.id,
+            ...(msg.key.participant ? { participant: msg.key.participant } : {}),
+          });
+          if (WHATSAPP_DM_POLICY !== 'pairing' && !matchesAllowedUser(senderId, ALLOWED_USERS, SESSION_DIR)) {
+            try {
+              console.log(JSON.stringify({
+                event: 'ignored',
+                reason: 'allowlist_mismatch',
+                chatId,
+                senderId,
+              }));
+            } catch {}
+            continue;
+          }
         }
       }
 
@@ -755,6 +1043,11 @@ async function startSocket() {
       }
 
       messageStore.remember(msg);
+      // Watcher: tag observe-eligible messages so the Python side archives
+      // them without engaging the agent. extractBridgeEvent (above) already
+      // produced every field the watcher reads; observe_only is the only
+      // watcher-specific addition here (fromOwner was set just above).
+      if (observeOnly) event.observe_only = true;
       messageQueue.push(event);
       emitDebugEvent({
         stage: 'queued',
@@ -770,6 +1063,34 @@ async function startSocket() {
         messageQueue.shift();
       }
     }
+  });
+
+  // Bulk-sync listener: receives WhatsApp's initial history dump (only
+  // delivered when paired as a Desktop-platform device with syncFullHistory
+  // enabled). Writes messages straight to the archive — bypasses the
+  // live-message queue, which would overflow on a multi-thousand dump.
+  // Skips events tagged with peerDataRequestSessionId — those are /backfill
+  // responses already handled by waitForHistoryEvent.
+  sock.ev.on('messaging-history.set', ({ messages, isLatest, peerDataRequestSessionId }) => {
+    if (peerDataRequestSessionId) return;
+    if (!Array.isArray(messages) || messages.length === 0) return;
+
+    let written = 0;
+    let skipped = 0;
+    for (const msg of messages) {
+      if (!msg || !msg.message) continue;
+      const record = buildBackfillRecord(msg);
+      if (!record) continue;
+      record.observe_only = true; // historical — don't engage the agent
+      if (writeArchiveRecord(record)) written++; else skipped++;
+    }
+    console.log(JSON.stringify({
+      event: 'history_sync',
+      written,
+      skipped_dup: skipped,
+      total: messages.length,
+      isLatest: !!isLatest,
+    }));
   });
 }
 
@@ -820,24 +1141,58 @@ app.post('/send', async (req, res) => {
     return res.status(503).json({ error: 'Not connected to WhatsApp' });
   }
 
-  const { chatId, message, replyTo } = req.body;
+  const {
+    chatId,
+    message,
+    replyTo,
+    mark_read: markRead = false,
+    typing_enabled: typingEnabled = true,
+    typing_seconds: typingSeconds,
+    prefix_override: prefixOverride,
+  } = req.body;
   if (!chatId || !message) {
     return res.status(400).json({ error: 'chatId and message are required' });
   }
 
+  const fmtOpts = prefixOverride !== undefined ? { prefixOverride } : {};
+
   try {
-    const chunks = splitLongMessage(formatOutgoingMessage(message));
+    // mark_read: drain unread keys and mark them read before sending
+    if (markRead) {
+      const keys = drainUnreadKeysForChat(chatId);
+      if (keys.length > 0 && sock.readMessages) {
+        await sock.readMessages(keys);
+      }
+    }
+
+    const chunks = splitLongMessage(formatOutgoingMessage(message, fmtOpts));
     const messageIds = [];
     for (let i = 0; i < chunks.length; i += 1) {
+      // Build the send payload (quoted reply, if any, rides in `options`).
+      // Only the first chunk carries the reply-to; later chunks are plain.
       const { content: payload, options } = buildTextSendPayload(chunks[i], {
         chatId,
         replyTo: i === 0 ? replyTo : undefined,
         messageStore,
       });
-      const sent = await sendWithTimeout(chatId, payload, options);
+      // Typing indicator only before the first chunk; subsequent chunks send
+      // immediately. performTypingAndSend forwards the built payload + options
+      // (so the quoted-reply metadata survives) to sendWithTimeout.
+      const sent = i === 0
+        ? await performTypingAndSend(sock, chatId, chunks[i], {
+            typingEnabled,
+            ...(typingSeconds !== undefined ? { typingSeconds } : {}),
+            payload,
+            sendOptions: options,
+            sendFn: (cid, content, opts) => sendWithTimeout(cid, content, opts),
+          })
+        : await sendWithTimeout(chatId, payload, options);
       trackSentMessageId(sent);
       messageStore.remember(sent);
-      if (sent?.key?.id) messageIds.push(sent.key.id);
+      if (sent?.key?.id) {
+        messageIds.push(sent.key.id);
+        recordHermesSend(chatId, sent.key.id);
+      }
       if (chunks.length > 1 && i < chunks.length - 1) {
         await sleep(CHUNK_DELAY_MS);
       }
@@ -893,12 +1248,38 @@ app.post('/send-media', async (req, res) => {
     return res.status(503).json({ error: 'Not connected to WhatsApp' });
   }
 
-  const { chatId, filePath, mediaType, caption, fileName } = req.body;
+  const {
+    chatId,
+    filePath,
+    mediaType,
+    caption,
+    fileName,
+    mark_read: markRead = false,
+    typing_enabled: typingEnabled = true,
+    typing_seconds: typingSeconds,
+  } = req.body;
   if (!chatId || !filePath) {
     return res.status(400).json({ error: 'chatId and filePath are required' });
   }
 
   try {
+    // mark_read: drain unread keys and mark them read before sending
+    if (markRead) {
+      const keys = drainUnreadKeysForChat(chatId);
+      if (keys.length > 0 && sock.readMessages) {
+        await sock.readMessages(keys);
+      }
+    }
+
+    // typing indicator before media send (uses caption text for duration calc)
+    const typingEnabled_ = typingEnabled !== false && TYPING_CFG.enabled !== false;
+    if (typingEnabled_) {
+      await sock.sendPresenceUpdate('composing', chatId);
+      const secs = typingSeconds ?? computeTypingSeconds(caption || '');
+      await sleep(secs * 1000);
+      await sock.sendPresenceUpdate('paused', chatId);
+    }
+
     if (!existsSync(filePath)) {
       return res.status(404).json({ error: `File not found: ${filePath}` });
     }
@@ -980,6 +1361,9 @@ app.post('/send-media', async (req, res) => {
     const sent = await sendWithTimeout(chatId, msgPayload);
     trackSentMessageId(sent);
     messageStore.remember(sent);
+    // Also feed the per-chat hermes-send recency map (read by isHermesOrigin /
+    // processIncoming) so owner-vs-bot origin detection stays accurate.
+    if (sent?.key?.id) recordHermesSend(chatId, sent.key.id);
     res.json({ success: true, messageId: sent?.key?.id });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1073,6 +1457,364 @@ app.post('/read', async (req, res) => {
   }
 });
 
+// Mark a chat as read without sending anything. Drains the per-chat
+// unread-keys queue (populated on every observed inbound) and calls
+// sock.readMessages so blue ticks land on the sender's side. Idempotent —
+// if there are no queued keys, this is a no-op and returns count=0.
+app.post('/mark-read', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected' });
+  }
+
+  const { chatId } = req.body;
+  if (!chatId) return res.status(400).json({ error: 'chatId required' });
+
+  try {
+    const keys = drainUnreadKeysForChat(chatId);
+    if (keys.length === 0) {
+      return res.json({ success: true, marked: 0 });
+    }
+    if (!sock.readMessages) {
+      // Older Baileys without readMessages support — silently no-op so the
+      // tool call doesn't surface as a failure to the agent.
+      return res.json({ success: true, marked: 0, note: 'readMessages unavailable' });
+    }
+    await sock.readMessages(keys);
+    res.json({ success: true, marked: keys.length });
+  } catch (err) {
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+// Backfill history for a specific chat.
+// POST /backfill { chatId, days?, count?, oldest_message_id?, oldest_timestamp? }
+//
+// Asks Baileys to fetch server-side history older than the provided anchor
+// point (or the current time if none given). Because fetchMessageHistory in
+// Baileys 7.x is event-driven — it issues a peer-data-operation request and
+// messages arrive asynchronously via 'messaging-history.set' — this handler
+// sets up a one-shot listener correlated by peerDataRequestSessionId, then
+// loops until it has collected enough messages or timed out.
+//
+// Returns:
+//   { success: true, fetched: N, oldest_ts: <ISO>, newest_ts: <ISO>, messages: [...] }
+//   { success: false, error: "<message>", partial: [...] }
+const BACKFILL_TIMEOUT_MS = parseInt(process.env.WHATSAPP_BACKFILL_TIMEOUT_MS || '30000', 10);
+const BACKFILL_EMPTY_RETRY = 1; // retry once if first batch is empty
+
+// ------------------------------------------------------------------
+// Direct-archive writes (used by the messaging-history.set listener
+// to persist initial-sync messages without going through Python).
+// Format matches extensions/whatsapp-watcher/archive.py exactly so
+// either writer can append to the same JSONL files.
+// ------------------------------------------------------------------
+const HERMES_HOME = process.env.HERMES_HOME || path.join(process.env.HOME || '~', '.hermes');
+const WA_ARCHIVE_DIR = path.join(HERMES_HOME, 'whatsapp', 'archive');
+const _archiveKnownIds = new Map(); // chatId -> Set<message_id>
+
+function _sanitizeChatId(chatId) {
+  return chatId.replace(/[^A-Za-z0-9._@-]/g, '_');
+}
+
+function _epochToIso(ts) {
+  // Match Python's datetime.fromtimestamp(ts, timezone.utc).isoformat():
+  // 2026-05-26T17:43:09+00:00 (no fractional seconds, +00:00 suffix).
+  if (typeof ts !== 'number' || !Number.isFinite(ts)) {
+    return new Date().toISOString().replace(/\.\d{3}Z$/, '+00:00');
+  }
+  return new Date(ts * 1000).toISOString().replace(/\.\d{3}Z$/, '+00:00');
+}
+
+function _loadKnownIds(chatId) {
+  let ids = _archiveKnownIds.get(chatId);
+  if (ids) return ids;
+  ids = new Set();
+  const p = path.join(WA_ARCHIVE_DIR, `${_sanitizeChatId(chatId)}.jsonl`);
+  if (existsSync(p)) {
+    try {
+      const content = readFileSync(p, 'utf-8');
+      for (const line of content.split('\n')) {
+        if (!line) continue;
+        try {
+          const rec = JSON.parse(line);
+          if (rec.message_id) ids.add(rec.message_id);
+        } catch {}
+      }
+    } catch {}
+  }
+  _archiveKnownIds.set(chatId, ids);
+  return ids;
+}
+
+function writeArchiveRecord(rec) {
+  // Returns true if written, false if deduped or invalid.
+  const chatId = rec.chatId;
+  if (!chatId || !rec.messageId) return false;
+  const ids = _loadKnownIds(chatId);
+  if (ids.has(rec.messageId)) return false;
+  mkdirSync(WA_ARCHIVE_DIR, { recursive: true });
+  const filePath = path.join(WA_ARCHIVE_DIR, `${_sanitizeChatId(chatId)}.jsonl`);
+  const out = {
+    ts: _epochToIso(rec.timestamp),
+    direction: rec.fromMe ? 'out' : 'in',
+    chat_id: chatId,
+    is_group: !!rec.isGroup,
+    sender_id: rec.senderId,
+    sender_name: rec.senderName || '',
+    sender_e164: rec.sender_e164 || null,
+    message_id: rec.messageId,
+    kind: rec.kind || 'text',
+    body: rec.body || '',
+    media_ref: rec.media_ref || null,
+    hermes_origin: !!rec.hermes_origin,
+    observe_only: !!rec.observe_only,
+    reply_to: null,
+    edited: false,
+    original_message_id: null,
+    deleted_by: null,
+  };
+  appendFileSync(filePath, JSON.stringify(out) + '\n', 'utf-8');
+  ids.add(rec.messageId);
+  return true;
+}
+
+/**
+ * Build a message payload identical in shape to what processIncoming / the
+ * messages.upsert handler would produce, but for a history-sync message.
+ * Media is intentionally skipped in v1 (media_ref = null).
+ */
+function buildBackfillRecord(msg) {
+  const chatId = msg.key?.remoteJid;
+  if (!chatId) return null;
+  const isBroadcast = chatId.includes('status') || chatId.endsWith('@broadcast');
+  if (isBroadcast) return null;
+  const fromMe = !!msg.key?.fromMe;
+  const isGroup = chatId.endsWith('@g.us');
+  const senderId = msg.key?.participant || chatId;
+  const body = extractText(msg);
+  const messageContent = getMessageContent(msg);
+  // Determine kind from message content (no download — placeholders only)
+  let kind = 'text';
+  let mediaRef = null;
+  if (messageContent.imageMessage) kind = 'image';
+  else if (messageContent.videoMessage) kind = 'video';
+  else if (messageContent.audioMessage || messageContent.pttMessage) kind = messageContent.pttMessage ? 'ptt' : 'audio';
+  else if (messageContent.documentMessage) kind = 'document';
+  else if (messageContent.stickerMessage) kind = 'sticker';
+  // msg.messageTimestamp is a protobuf Long in Baileys 7.x; JSON.stringify
+  // serializes Long objects as {low, high, unsigned} which Python's
+  // archive.write_message can't parse — it then falls back to now(),
+  // wiping the real message timestamp. Coerce to a plain Unix seconds
+  // number here so the wire payload is JSON-clean.
+  const tsRaw = msg.messageTimestamp;
+  let timestamp = null;
+  if (typeof tsRaw === 'number') {
+    timestamp = tsRaw;
+  } else if (typeof tsRaw === 'string') {
+    timestamp = parseInt(tsRaw, 10);
+  } else if (tsRaw && typeof tsRaw.toNumber === 'function') {
+    timestamp = tsRaw.toNumber();
+  } else if (tsRaw && typeof tsRaw === 'object' && 'low' in tsRaw) {
+    timestamp = tsRaw.low + (tsRaw.high || 0) * 0x100000000;
+  }
+
+  // Backfilled messages don't carry msg.pushName (that's a live-only field).
+  // Best-effort fallback: if the senderId is a LID we have a reverse
+  // mapping for, surface the resolved phone number as sender_e164 AND use
+  // it as the displayed sender_name when no other name is available. The
+  // lidToPhone map is built from the session's lid-mapping-*.json files
+  // and refreshed on every creds.update event.
+  let resolvedE164 = null;
+  if (senderId && senderId.endsWith('@lid')) {
+    const lidValue = senderId.split('@', 1)[0];
+    const phone = lidToPhone[lidValue];
+    if (phone) {
+      resolvedE164 = '+' + phone;
+    }
+  } else if (senderId && senderId.endsWith('@s.whatsapp.net')) {
+    const phonePart = senderId.split('@', 1)[0];
+    if (/^\d+$/.test(phonePart)) {
+      resolvedE164 = '+' + phonePart;
+    }
+  }
+  const senderName = msg.pushName || resolvedE164 || '';
+
+  return {
+    messageId: msg.key?.id,
+    chatId,
+    fromMe,
+    isGroup,
+    senderId,
+    senderName,
+    sender_e164: resolvedE164,
+    body: body || (kind !== 'text' ? `[${kind} received]` : ''),
+    kind,
+    media_ref: mediaRef,
+    timestamp,
+    isGroup,
+    observe_only: false,
+    hermes_origin: false,
+  };
+}
+
+/**
+ * Wait for a 'messaging-history.set' event whose peerDataRequestSessionId
+ * matches requestId. Resolves with the event payload or rejects on timeout.
+ */
+function waitForHistoryEvent(requestId, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      sock.ev.off('messaging-history.set', handler);
+      reject(new Error('timeout'));
+    }, timeoutMs);
+
+    function handler(event) {
+      // Match by peerDataRequestSessionId when present; fall back to accepting
+      // any ON_DEMAND sync event if the sessionId is absent (Baileys race).
+      const sid = event.peerDataRequestSessionId;
+      if (sid && sid !== requestId) return;
+      clearTimeout(timer);
+      sock.ev.off('messaging-history.set', handler);
+      resolve(event);
+    }
+
+    sock.ev.on('messaging-history.set', handler);
+  });
+}
+
+app.post('/backfill', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+
+  const {
+    chatId,
+    days = 10,
+    count = 500,
+    oldest_message_id: oldestMsgId,
+    oldest_timestamp: oldestTs,
+    oldest_from_me: oldestFromMe = false,
+  } = req.body || {};
+
+  if (!chatId) {
+    return res.status(400).json({ error: 'chatId is required' });
+  }
+
+  const cutoffTs = Date.now() / 1000 - days * 86400;
+  const maxCount = Math.max(1, parseInt(count, 10) || 500);
+
+  // fetchMessageHistory needs a REAL anchor key (a message that exists in
+  // this chat on WhatsApp's server) — it fetches messages OLDER than that
+  // anchor. Without one, the PDO request either returns empty or times
+  // out (silent — there's no "invalid anchor" error from WhatsApp).
+  //
+  // Earlier we passed `id: 'NONE'` as a placeholder; that silently produced
+  // garbage results indistinguishable from "no history available". Refuse
+  // the request explicitly instead and let the caller skip the chat with
+  // a clear reason.
+  if (!oldestMsgId) {
+    return res.json({
+      success: false,
+      error: 'no_anchor',
+      reason:
+        'fetchMessageHistory requires a real existing message id from this chat as anchor. ' +
+        'Caller must supply oldest_message_id (and oldest_timestamp). ' +
+        'For empty-archive chats, there is no anchor available and history ' +
+        'cannot be fetched without observing live traffic first.',
+    });
+  }
+
+  // Build the anchor key from caller-supplied ids. fromMe must match the
+  // server-side message's actual sender; if the anchor was a message you
+  // sent, passing fromMe:false here silently returns empty (the key won't
+  // resolve to a real message on WhatsApp's side).
+  let anchorKey = {
+    remoteJid: chatId,
+    fromMe: !!oldestFromMe,
+    id: oldestMsgId,
+  };
+  let anchorTs = oldestTs ? Number(oldestTs) : Math.floor(Date.now() / 1000);
+
+  const collected = [];
+  let emptyRetries = 0;
+
+  try {
+    while (collected.length < maxCount) {
+      // Issue the request — fetchMessageHistory returns a peer-op message ID
+      // (which serves as peerDataRequestSessionId in the response event).
+      const requestId = await sock.fetchMessageHistory(
+        Math.min(maxCount - collected.length, 100),
+        anchorKey,
+        anchorTs * 1000, // Baileys expects ms for the PDO request
+      );
+
+      let event;
+      try {
+        event = await waitForHistoryEvent(requestId, BACKFILL_TIMEOUT_MS);
+      } catch (timeoutErr) {
+        // Timeout — return whatever we have so far.
+        return res.json({
+          success: false,
+          error: 'timeout',
+          partial: collected,
+        });
+      }
+
+      const msgs = event.messages || [];
+      if (msgs.length === 0) {
+        emptyRetries += 1;
+        if (emptyRetries > BACKFILL_EMPTY_RETRY) break;
+        continue;
+      }
+      emptyRetries = 0;
+
+      let reachedCutoff = false;
+      for (const msg of msgs) {
+        const ts = Number(msg.messageTimestamp || 0);
+        if (ts > 0 && ts < cutoffTs) {
+          reachedCutoff = true;
+          continue; // skip messages older than requested window
+        }
+        const record = buildBackfillRecord(msg);
+        if (record) collected.push(record);
+      }
+
+      if (reachedCutoff) break;
+
+      // Advance anchor to the oldest message in this batch for the next loop.
+      const sorted = msgs
+        .filter(m => m.key?.id && m.messageTimestamp)
+        .sort((a, b) => Number(a.messageTimestamp) - Number(b.messageTimestamp));
+      if (sorted.length === 0) break;
+      const oldest = sorted[0];
+      anchorKey = { remoteJid: chatId, fromMe: !!oldest.key.fromMe, id: oldest.key.id };
+      anchorTs = Number(oldest.messageTimestamp);
+
+      // If the server indicated this is the full history, stop looping.
+      if (event.isLatest) break;
+      // Avoid hammering WhatsApp between loop iterations.
+      await sleep(500);
+    }
+
+    const timestamps = collected
+      .map(m => m.timestamp)
+      .filter(t => t && t > 0)
+      .map(Number);
+    const oldestTsOut = timestamps.length ? Math.min(...timestamps) : null;
+    const newestTsOut = timestamps.length ? Math.max(...timestamps) : null;
+
+    return res.json({
+      success: true,
+      fetched: collected.length,
+      oldest_ts: oldestTsOut ? new Date(oldestTsOut * 1000).toISOString() : null,
+      newest_ts: newestTsOut ? new Date(newestTsOut * 1000).toISOString() : null,
+      messages: collected,
+    });
+  } catch (err) {
+    return res.json({ success: false, error: err.message });
+  }
+});
+
 // Chat info
 app.get('/chat/:id', async (req, res) => {
   const chatId = req.params.id;
@@ -1109,8 +1851,9 @@ app.get('/health', (req, res) => {
   });
 });
 
-// Start
-if (PAIR_ONLY) {
+// Start — only when bridge.js is the entry point, not when imported as a module.
+const isMain = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
+if (isMain && PAIR_ONLY) {
   // Pair-only mode: just connect, show QR, save creds, exit. No HTTP server.
   if (PAIR_JSON) {
     emitPairEvent({ event: 'started', session: SESSION_DIR });
@@ -1126,7 +1869,7 @@ if (PAIR_ONLY) {
     }
     process.exit(1);
   });
-} else {
+} else if (isMain) {
   app.listen(PORT, '127.0.0.1', () => {
     console.log(`🌉 WhatsApp bridge listening on port ${PORT} (mode: ${WHATSAPP_MODE})`);
     console.log(`📁 Session stored in: ${SESSION_DIR}`);
