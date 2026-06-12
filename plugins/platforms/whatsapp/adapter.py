@@ -16,12 +16,14 @@ with different backends via a bridge pattern.
 """
 
 import asyncio
+import json
 import logging
 import os
 import platform
 import re
 import signal
 import subprocess
+from datetime import datetime, timezone
 
 _IS_WINDOWS = platform.system() == "Windows"
 from pathlib import Path
@@ -468,6 +470,8 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         # "Fatal whatsapp adapter error" plus dispatch a fatal-error
         # notification before the normal "✓ whatsapp disconnected" fires.
         self._shutting_down: bool = False
+        # Optional hook registry injected by run.py after construction.
+        self._hook_registry = None
 
         # Text debounce batching (mirrors Telegram adapter pattern).
         # WhatsApp often delivers multiple messages in rapid succession
@@ -505,6 +509,141 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         if not math.isfinite(parsed) or parsed < 0:
             return float(default)
         return parsed
+
+    def set_hook_registry(self, registry) -> None:
+        """Inject the gateway HookRegistry so hooks can be emitted."""
+        self._hook_registry = registry
+
+    # ------------------------------------------------------------------
+    # Engagement window helpers (engagements.json is written by the
+    # whatsapp-watcher hook)
+    # ------------------------------------------------------------------
+
+    def _engagements_path(self) -> Path:
+        from hermes_constants import get_hermes_home
+        return get_hermes_home() / "whatsapp" / "engagements.json"
+
+    def _engagement_active_for_chat(self, chat_id: str) -> bool:
+        """True if there is a non-expired engagement window for chat_id."""
+        if not chat_id:
+            return False
+        path = self._engagements_path()
+        if not path.exists():
+            return False
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return False
+        window = data.get("windows", {}).get(chat_id)
+        if not window:
+            return False
+        try:
+            expires = datetime.fromisoformat(window["expires_at"])
+        except (KeyError, ValueError):
+            return False
+        return expires > datetime.now(timezone.utc)
+
+    def _engagement_record(self, chat_id: str) -> Optional[Dict[str, Any]]:
+        """Return the raw engagement window dict for chat_id, or None."""
+        path = self._engagements_path()
+        if not path.exists():
+            return None
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        return data.get("windows", {}).get(chat_id)
+
+    def _effective_reply_prefix(self, chat_id: Optional[str] = None) -> str:
+        """Resolve outgoing reply prefix for a given target chat.
+
+        Resolution order:
+        1. Per-engagement window reply_prefix override (if set and non-None).
+        2. Engagement-default override — env WHATSAPP_ENGAGEMENT_REPLY_PREFIX
+           or config engagement_reply_prefix (only when chat is engaged).
+           Falls through to empty string when engaged but no override.
+        3. General prefix resolution from WhatsAppBehaviorMixin.
+        """
+        # 1. Per-engagement override.
+        if chat_id:
+            engagement = self._engagement_record(chat_id)
+            if engagement is not None and engagement.get("reply_prefix") is not None:
+                raw = engagement["reply_prefix"]
+                return raw.replace("\\n", "\n") if raw else ""
+
+        # 2. Engagement default override (active only if chat is engaged).
+        if chat_id and self._engagement_active_for_chat(chat_id):
+            cfg = self.config.extra.get("engagement_reply_prefix")
+            if cfg is not None:
+                return cfg.replace("\\n", "\n")
+            env = os.getenv("WHATSAPP_ENGAGEMENT_REPLY_PREFIX")
+            if env is not None:
+                return env.replace("\\n", "\n")
+            # Engaged but no explicit override — use empty prefix.
+            return ""
+
+        # 3. General reply prefix (mixin behaviour).
+        return super()._effective_reply_prefix()
+
+    # ------------------------------------------------------------------
+    # Unified inbound-event handler (called from poll loop)
+    # ------------------------------------------------------------------
+
+    async def _handle_incoming_event(self, data: dict) -> None:
+        """Process a single raw inbound event from the bridge.
+
+        Steps (in order):
+        1. Emit message:received hook (always, before any gating).
+        2. If observe_only and no active engagement window, return early.
+        3. Dispatch to agent (the DM/group/mention policy gate lives inside
+           _build_message_event, which _dispatch_to_agent calls).
+        """
+        # 1. Emit hook before gating.
+        if self._hook_registry is not None:
+            try:
+                await self._hook_registry.emit("message:received", data)
+            except Exception:
+                logger.exception("[%s] message:received hook raised", self.name)
+
+        # 2. Observe-only messages only reach the agent if an engagement is active.
+        if data.get("observe_only"):
+            if not self._engagement_active_for_chat(data.get("chatId", "")):
+                return
+
+        # 3. Dispatch to agent.
+        #
+        # NOTE: there is deliberately no _should_process_message() call here.
+        # It is the first statement of _build_message_event() (called below via
+        # _dispatch_to_agent), so gating an extra time at this level was purely
+        # redundant — same predicate, same `data`, no side effects in between.
+        # Upstream 0.19 treats _build_message_event as the single intake
+        # chokepoint (its own _poll_messages does `event = await
+        # _build_message_event(...); if event:`) and its read-receipt tests
+        # assert that shape. Keeping the duplicate short-circuited those tests
+        # before they reached the gate. Rejected messages still never reach the
+        # agent and still never get a read receipt.
+        await self._dispatch_to_agent(data)
+
+    async def _dispatch_to_agent(self, data: dict) -> None:
+        """Build a MessageEvent from raw data and hand it off to handle_message.
+
+        TEXT events go through the debounce batcher (rapid-fire messages get
+        concatenated into one agent invocation); everything else dispatches
+        immediately.
+        """
+        event = await self._build_message_event(data)
+        if event:
+            # Fire-and-forget: a slow bridge /read must not delay message
+            # dispatch (matches BlueBubbles asyncio.create_task pattern for
+            # mark_read). Upstream 0.19 put this in _poll_messages; the watcher
+            # patch moved event-building here, so the receipt follows it — it
+            # still fires only for messages that survived _should_process_message
+            # (called inside _build_message_event), i.e. policy-accepted ones.
+            asyncio.create_task(self._send_read_receipt(data))
+            if event.message_type == MessageType.TEXT:
+                self._enqueue_text_event(event)
+            else:
+                await self.handle_message(event)
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         """
@@ -996,6 +1135,96 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         except Exception as e:
             return SendResult(success=False, error=str(e))
 
+    async def _bridge_post(
+        self,
+        chat_id: str,
+        text: str,
+        reply_to: Optional[str] = None,
+        mark_read: Optional[bool] = None,
+        typing_enabled: Optional[bool] = None,
+    ) -> Dict[str, Any]:
+        """Low-level POST of a single text chunk to the bridge /send endpoint.
+
+        Returns the parsed JSON response dict.  Raises on HTTP error or
+        connection failure.
+        """
+        import aiohttp
+
+        payload: Dict[str, Any] = {"chatId": chat_id, "message": text}
+        if reply_to:
+            payload["replyTo"] = reply_to
+        if mark_read is not None:
+            payload["mark_read"] = mark_read
+        if typing_enabled is not None:
+            payload["typing_enabled"] = typing_enabled
+
+        async with self._http_session.post(
+            f"http://127.0.0.1:{self._bridge_port}/send",
+            json=payload,
+            timeout=aiohttp.ClientTimeout(total=30),
+        ) as resp:
+            if resp.status == 200:
+                return await resp.json()
+            error = await resp.text()
+            raise RuntimeError(f"Bridge /send error {resp.status}: {error}")
+
+    async def send_message(
+        self,
+        chat_id: str,
+        text: str,
+        *,
+        hermes_origin: bool = True,
+        reply_to: Optional[str] = None,
+        mark_read: Optional[bool] = None,
+        typing_enabled: Optional[bool] = None,
+    ) -> SendResult:
+        """Send a single text message and emit the message:sent hook.
+
+        This is the hook-aware façade over _bridge_post.  The existing
+        ``send()`` method handles formatting + chunking; this method is
+        intentionally thin — one bridge call, one hook emission.
+
+        ``mark_read`` and ``typing_enabled`` control bridge-side side-effects.
+        When either is None the value is derived from the current mode: in
+        self-chat mode both default to False; otherwise both default to True.
+        """
+        whatsapp_mode = os.getenv("WHATSAPP_MODE", "self-chat")
+        is_self_chat = whatsapp_mode == "self-chat"
+        if mark_read is None:
+            mark_read = not is_self_chat
+        if typing_enabled is None:
+            typing_enabled = not is_self_chat
+        try:
+            result = await self._bridge_post(
+                chat_id, text,
+                reply_to=reply_to,
+                mark_read=mark_read,
+                typing_enabled=typing_enabled,
+            )
+        except Exception as e:
+            return SendResult(success=False, error=str(e))
+
+        message_id = result.get("message_id") or result.get("messageId")
+
+        event: Dict[str, Any] = {
+            "chatId": chat_id,
+            "messageId": message_id,
+            "body": text,
+            "hermes_origin": hermes_origin,
+            "direction": "out",
+        }
+        timestamp = result.get("timestamp")
+        if timestamp is not None:
+            event["timestamp"] = timestamp
+
+        if self._hook_registry is not None:
+            try:
+                await self._hook_registry.emit("message:sent", event)
+            except Exception:
+                logger.exception("[%s] message:sent hook raised", self.name)
+
+        return SendResult(success=True, message_id=message_id)
+
     async def edit_message(
         self,
         chat_id: str,
@@ -1346,16 +1575,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                     if resp.status == 200:
                         messages = await resp.json()
                         for msg_data in messages:
-                            event = await self._build_message_event(msg_data)
-                            if event:
-                                # Fire-and-forget: a slow bridge /read must not
-                                # delay message dispatch (matches BlueBubbles
-                                # asyncio.create_task pattern for mark_read).
-                                asyncio.create_task(self._send_read_receipt(msg_data))
-                                if event.message_type == MessageType.TEXT:
-                                    self._enqueue_text_event(event)
-                                else:
-                                    await self.handle_message(event)
+                            await self._handle_incoming_event(msg_data)
             except asyncio.CancelledError:
                 break
             except Exception as e:

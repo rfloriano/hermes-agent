@@ -15,6 +15,10 @@ Events:
   - agent:step          -- Each turn in the tool-calling loop
   - agent:end           -- Agent finishes processing
   - command:*           -- Any slash command executed (wildcard match)
+  - message:received    -- Inbound message arrived at a platform adapter
+                           (fires before any agent-gating decision)
+  - message:sent        -- Outbound message dispatched from a platform adapter
+                           (fires after the underlying send call returns)
 
 Errors in hooks are caught and logged but never block the main pipeline.
 

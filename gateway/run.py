@@ -13404,6 +13404,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             adapter.set_topic_recovery_fn(self._recover_telegram_topic_thread_id)
             adapter.set_authorization_check(self._make_adapter_auth_check(adapter.platform))
             adapter.set_platform_event_handler(self._primary_platform_event_handler())
+            self._attach_hook_registry(adapter)
             adapter._busy_text_mode = self._busy_text_mode
             _pending_connects.append((platform, platform_config, adapter))
 
@@ -15208,6 +15209,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     adapter.set_topic_recovery_fn(self._recover_telegram_topic_thread_id)
                     adapter.set_authorization_check(self._make_adapter_auth_check(adapter.platform))
                     adapter.set_platform_event_handler(self._primary_platform_event_handler())
+                    self._attach_hook_registry(adapter)
                     adapter._busy_text_mode = self._busy_text_mode
 
                     # Reconnect after an outage: preserve the platform's
@@ -16278,6 +16280,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
         return connected
 
+    def _attach_hook_registry(self, adapter: BasePlatformAdapter) -> None:
+        """Wire the hook registry into an adapter when both sides support it.
+
+        Guards ``self.hooks`` as well as the adapter method: adapters are also
+        configured from code paths that build a runner via ``__new__`` (upstream
+        does this in tests), where ``__init__`` never ran and ``hooks`` is unset.
+        """
+        hooks = getattr(self, "hooks", None)
+        if hooks is not None and hasattr(adapter, "set_hook_registry"):
+            adapter.set_hook_registry(hooks)
+
     def _configure_profile_adapter(
         self,
         adapter: BasePlatformAdapter,
@@ -16316,6 +16329,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         adapter.set_platform_event_handler(
             self._make_profile_platform_event_handler(profile_name)
         )
+        self._attach_hook_registry(adapter)
         text_modes = getattr(self, "_busy_text_modes_by_profile", None)
         adapter._busy_text_mode = (
             text_modes.get(profile_name, self._busy_text_mode)
