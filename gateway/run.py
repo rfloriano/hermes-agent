@@ -11261,8 +11261,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _set_reaction(self._handle_reaction_event)
             adapter.set_topic_recovery_fn(self._recover_telegram_topic_thread_id)
             adapter.set_authorization_check(self._make_adapter_auth_check(adapter.platform))
+            self._attach_hook_registry(adapter)
             adapter._busy_text_mode = self._busy_text_mode
-            
+
             # Try to connect
             logger.info("Connecting to %s...", platform.value)
             self._update_platform_runtime_status(
@@ -12644,6 +12645,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _set_reaction(self._handle_reaction_event)
                     adapter.set_topic_recovery_fn(self._recover_telegram_topic_thread_id)
                     adapter.set_authorization_check(self._make_adapter_auth_check(adapter.platform))
+                    self._attach_hook_registry(adapter)
                     adapter._busy_text_mode = self._busy_text_mode
 
                     # Reconnect after an outage: preserve the platform's
@@ -13595,6 +13597,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 await self._safe_adapter_disconnect(adapter, platform)
         return connected
 
+    def _attach_hook_registry(self, adapter: BasePlatformAdapter) -> None:
+        """Wire the hook registry into an adapter when both sides support it.
+
+        Guards ``self.hooks`` as well as the adapter method: adapters are also
+        configured from code paths that build a runner via ``__new__`` (upstream
+        does this in tests), where ``__init__`` never ran and ``hooks`` is unset.
+        """
+        hooks = getattr(self, "hooks", None)
+        if hooks is not None and hasattr(adapter, "set_hook_registry"):
+            adapter.set_hook_registry(hooks)
+
     def _configure_profile_adapter(
         self,
         adapter: BasePlatformAdapter,
@@ -13615,6 +13628,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         adapter.set_authorization_check(
             self._make_adapter_auth_check(platform, profile_name=profile_name)
         )
+        self._attach_hook_registry(adapter)
         adapter._busy_text_mode = self._busy_text_mode
 
     async def _run_secondary_profile_reconnect(
