@@ -18738,6 +18738,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if canonical == "voice":
             return await self._handle_voice_command(event)
 
+        if canonical == "tts":
+            return await self._handle_tts_command(event)
+
         if self._draining:
             return f"⏳ Gateway is {self._status_action_gerund()} and is not accepting new work right now."
 
@@ -23302,7 +23305,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Return whether inbound voice/STT transcripts should be echoed to chat."""
         return bool(getattr(self.config, "stt_echo_transcripts", True))
 
-    async def _send_voice_reply(self, event: MessageEvent, text: str) -> None:
+    async def _send_voice_reply(self, event: MessageEvent, text: str) -> bool:
         """Generate TTS audio and send as a voice message before the text reply."""
         audio_path = None
         actual_paths: List[str] = []
@@ -23311,7 +23314,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             tts_text = _strip_markdown_for_tts(text)
             if not tts_text:
-                return
+                return False
 
             # Platform-aware output path: platforms whose native voice
             # bubbles require Ogg/Opus (OPUS_VOICE_PLATFORMS — Telegram,
@@ -23327,7 +23330,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 result = json.loads(result_json)
             except (json.JSONDecodeError, TypeError):
                 logger.warning("Auto voice reply TTS returned invalid JSON: %s", result_json[:200] if result_json else result_json)
-                return
+                return False
 
             # Final delivery may be one combined file or multiple separately
             # valid files when combination is unavailable or would exceed a
@@ -23341,7 +23344,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             ]
             if not result.get("success") or not actual_paths:
                 logger.warning("Auto voice reply TTS failed: %s", result.get("error"))
-                return
+                return False
 
             adapter = self._adapter_for_source(event.source)
 
@@ -23371,10 +23374,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     thread_meta["notify"] = True
                 else:
                     thread_meta = {"notify": True}
+            delivered = False
             for actual_path in actual_paths:
                 if in_voice_channel:
                     play_voice = cast(Callable[..., Awaitable[Any]], play_in_voice_channel)
                     await play_voice(guild_id, actual_path)
+                    delivered = True
                 elif callable(send_voice):
                     send_voice_call = cast(Callable[..., Awaitable[Any]], send_voice)
                     send_kwargs: Dict[str, Any] = {
@@ -23384,8 +23389,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "metadata": thread_meta,
                     }
                     await send_voice_call(**send_kwargs)
+                    delivered = True
+            return delivered
         except Exception as e:
             logger.warning("Auto voice reply failed: %s", e, exc_info=True)
+            return False
         finally:
             for p in ({audio_path, *actual_paths} - {None}):
                 try:
