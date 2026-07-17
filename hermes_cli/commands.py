@@ -244,6 +244,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("wake", "Toggle the 'Hey Hermes' wake word listener", "Configuration",
                cli_only=True, args_hint="[on|off|status]",
                subcommands=("on", "off", "status")),
+    CommandDef("tts", "Send text as a voice message", "Configuration",
+               gateway_only=True, args_hint="<text>"),
     CommandDef("busy", "Control what Enter does while Hermes is working", "Configuration",
                cli_only=True, args_hint="[queue|steer|interrupt|status]",
                subcommands=("queue", "steer", "interrupt", "status")),
@@ -649,6 +651,8 @@ _TELEGRAM_MENU_PRIORITY = (
     "resume",
     "sessions",
     "model",
+    "voice",
+    "tts",
     # Maintenance / diagnostics — the ones that prompted this priority list.
     "debug",
     "restart",
