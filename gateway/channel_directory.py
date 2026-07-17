@@ -163,9 +163,13 @@ async def build_channel_directory(adapters: Dict[Any, Any]) -> Dict[str, Any]:
 
     # Merge watcher-managed contacts into the whatsapp section so that
     # send_message(target="whatsapp:<name>") can resolve them even if no
-    # Hermes session has been started for that chat yet.
-    if "whatsapp" in platforms:
-        platforms["whatsapp"] = _merge_whatsapp_watcher_contacts(platforms["whatsapp"])
+    # Hermes session has been started for that chat yet — and even when no
+    # whatsapp adapter is currently connected. 0.18 only seeds the "whatsapp"
+    # platform key on live connect, so read through .get() and set the key
+    # ourselves rather than guarding on its presence.
+    watcher_whatsapp = _merge_whatsapp_watcher_contacts(platforms.get("whatsapp", []))
+    if watcher_whatsapp:
+        platforms["whatsapp"] = watcher_whatsapp
     # Overlay user-maintained friendly names before persisting.
     _apply_channel_aliases(platforms)
 
