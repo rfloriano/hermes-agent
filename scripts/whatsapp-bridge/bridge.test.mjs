@@ -297,3 +297,152 @@ test('buildBackfillRecord extracts text and kind (source-level)', () => {
   assert.match(src, /imageMessage.*kind.*image|kind.*image.*imageMessage/s);
 });
 
+
+// --- reconnect backoff wiring: source-level sanity ---
+//
+// reconnect_policy.test.mjs proves the decision logic. These prove bridge.js
+// actually USES it -- the policy being correct is worthless if the socket
+// handler still hardcodes a 3s retry, or if the give-up branch does nothing.
+//
+// Assertions are deliberately token-based rather than exact-call-shape
+// regexes: `npm run fix` reflows this file, and a wiring test that breaks on
+// whitespace teaches people to delete wiring tests.
+
+/**
+ * Slice out one branch of the connection-close handler so assertions are
+ * scoped to it. Matching against the whole file is how the earlier version of
+ * `keeps 401 -> exit` passed while asserting nothing: `process.exit(1)` was
+ * already present for the 401 path, so the STOP branch could have been empty.
+ */
+function closeBranchSource(src, actionConst) {
+  const start = src.indexOf(`decision.action === DisconnectAction.${actionConst}`);
+  assert.ok(start > -1, `${actionConst} branch not found in bridge.js`);
+  const rest = src.slice(start);
+  // Branches are separated by `} else if (` / `} else {` at the same depth.
+  const end = rest.search(/\n\s*\} else[\s{]/);
+  return end === -1 ? rest : rest.slice(0, end);
+}
+
+/**
+ * Same idea as closeBranchSource, applied to the sustained-connection timer:
+ * return only what runs INSIDE the setTimeout callback.
+ *
+ * Scoping matters for exactly the reason it did in the STOP branch. Asserting
+ * that `setTimeout` and the reset statements both merely *exist somewhere* is
+ * satisfied by a build that keeps the timer but performs the resets eagerly on
+ * 'open' -- which is precisely the flap bug this timer exists to prevent (a
+ * socket accepted and instantly dropped resets the schedule forever).
+ */
+function sustainedResetCallbackSource(src) {
+  const start = src.indexOf('sustainedConnectionTimer = setTimeout(() =>');
+  assert.ok(start > -1, 'sustained-connection timer not found in bridge.js');
+  const rest = src.slice(start);
+  const end = rest.indexOf('SUSTAINED_CONNECTION_MS)');
+  assert.ok(end > -1, 'could not delimit the sustained-connection timer callback');
+  return rest.slice(0, end);
+}
+
+test('bridge.js delegates disconnect handling to reconnect_policy', () => {
+  const src = readFileSync(BRIDGE_PATH, 'utf8');
+  assert.match(src, /from '\.\/reconnect_policy\.js'/);
+  assert.match(src, /decideReconnect\(/);
+  assert.match(src, /classifyDisconnect\(/);
+  // The scheduled delay must come from the decision, not a literal.
+  assert.match(src, /setTimeout\(startSocket,\s*decision\.delayMs\)/);
+});
+
+test('REGRESSION: the unconditional 3s retry is gone from bridge.js', () => {
+  const src = readFileSync(BRIDGE_PATH, 'utf8');
+  assert.doesNotMatch(
+    src,
+    /setTimeout\(startSocket,\s*reason === 515 \? 1000 : 3000\)/,
+    'the fixed 3s retry that caused the 2026-07-28 outage must not come back',
+  );
+  assert.doesNotMatch(
+    src,
+    /setTimeout\(startSocket,\s*\d+\)/,
+    'reconnect delay must always come from the backoff policy',
+  );
+});
+
+test('CRITICAL: the STOP branch exits the process', () => {
+  // Giving up is only recoverable because the process exits: nothing polls
+  // /health outside connect(), and /messages answers 200 [] whatever the
+  // connection state, so a bridge that gave up while staying alive would
+  // leave the gateway believing WhatsApp was connected indefinitely.
+  // _check_managed_bridge_exit() watches the PROCESS, once per second.
+  const branch = closeBranchSource(readFileSync(BRIDGE_PATH, 'utf8'), 'STOP');
+  assert.match(
+    branch,
+    /process\.exit\(1\)/,
+    'STOP must exit non-zero -- it is the only signal the gateway can observe',
+  );
+});
+
+test('the EXIT branch (401) still exits the process', () => {
+  const branch = closeBranchSource(readFileSync(BRIDGE_PATH, 'utf8'), 'EXIT');
+  assert.match(branch, /process\.exit\(1\)/);
+});
+
+test('the RETRY path schedules rather than exits', () => {
+  const src = readFileSync(BRIDGE_PATH, 'utf8');
+  // The final `else` of the close handler is the retry path; it must schedule.
+  assert.match(src, /setTimeout\(startSocket,\s*decision\.delayMs\)/);
+});
+
+test('REGRESSION: attempt budgets are per disconnect class, not global', () => {
+  // A single shared counter let 5 unrelated failures exhaust the budget for
+  // the post-QR-scan 515, killing pairing right after the phone reports
+  // success.
+  //
+  // This is the real guard for that bug. The pure-policy suite cannot catch
+  // it -- reconnect_policy.js is handed an `attempt` number and cannot know
+  // how the caller derived it -- so the assertion has to be about how
+  // bridge.js counts.
+  const src = readFileSync(BRIDGE_PATH, 'utf8');
+  assert.match(src, /reconnectAttemptsByClass/);
+  assert.match(
+    src,
+    /attempt:\s*reconnectAttemptsByClass\[disconnectClass\]/,
+    'the attempt passed to decideReconnect must come from the per-class counter',
+  );
+});
+
+test('the budget resets only after a sustained connection', () => {
+  // Resetting on any 'open' let a flapping socket restart the schedule every
+  // few seconds and never deplete the budget: measured at 266 sockets and
+  // still going, where the fixed build stops after 11.
+  const src = readFileSync(BRIDGE_PATH, 'utf8');
+  assert.match(src, /SUSTAINED_CONNECTION_MS/);
+  assert.match(src, /sustainedConnectionTimer = setTimeout\(/);
+  // ...and a close must cancel a pending reset.
+  assert.match(src, /clearTimeout\(sustainedConnectionTimer\)/);
+
+  // The load-bearing part: the reset must happen INSIDE the timer callback.
+  // Keeping the timer but hoisting the resets out of it restores the flap bug
+  // while leaving every token above present.
+  const callback = sustainedResetCallbackSource(src);
+  assert.match(
+    callback,
+    /reconnectAttemptsByClass = Object\.create\(null\)/,
+    'budgets must be cleared inside the sustained-connection timer, not on open',
+  );
+  assert.match(
+    callback,
+    /reconnectAttemptsTotal = 0/,
+    'the total counter must reset inside the timer too',
+  );
+});
+
+test('bridge.js preserves the pairing events through the new paths', () => {
+  const src = readFileSync(BRIDGE_PATH, 'utf8');
+  assert.match(src, /emitPairEvent\(\{ event: 'error', error: 'logged_out', reason \}\)/);
+  assert.match(src, /emitPairEvent\(\{ event: 'disconnected', reason \}\)/);
+  assert.match(src, /emitPairEvent\(\{ event: 'error', error: 'reconnect_gave_up', reason \}\)/);
+});
+
+test('/health surfaces reconnect state', () => {
+  const src = readFileSync(BRIDGE_PATH, 'utf8');
+  assert.match(src, /reconnectAttempts:\s*reconnectAttemptsTotal/);
+  assert.match(src, /reconnectAttemptsByClass:/);
+});

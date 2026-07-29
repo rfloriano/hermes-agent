@@ -33,6 +33,7 @@ import qrcode from 'qrcode-terminal';
 import { matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
 import { createOutboundIdTracker } from './outbound_ids.js';
 import { classifyOwnerMessageGate } from './owner_message_gate.js';
+import { DisconnectAction, classifyDisconnect, decideReconnect } from './reconnect_policy.js';
 import {
   buildPollPayload,
   buildLocationPayload,
@@ -630,6 +631,23 @@ async function performTypingAndSend(sock, chatId, text, opts = {}) {
 
 let sock = null;
 let connectionState = 'disconnected';
+// Consecutive failed connection attempts in the current outage, counted PER
+// disconnect class. A single shared counter was wrong: after a handful of 503s
+// the next 515 would be judged against the exhausted tail of the retryable
+// schedule, and the post-QR-scan 515 that WhatsApp requires to finish pairing
+// would be told to give up — killing pairing right after the phone reports
+// success. Each class now depletes its own budget.
+let reconnectAttemptsByClass = Object.create(null);
+// Total consecutive failures across classes; observability only, never a
+// scheduling input.
+let reconnectAttemptsTotal = 0;
+let lastReconnectDecision = null;
+// A connection must survive this long before it counts as "recovered" and
+// clears the budgets. Resetting on 'open' alone let a flapping socket
+// (accept -> immediate drop) restart the schedule at ~2.3s forever, which is
+// the hammering behaviour this whole change exists to remove.
+const SUSTAINED_CONNECTION_MS = 60_000;
+let sustainedConnectionTimer = null;
 
 function emitPairEvent(event) {
   if (!PAIR_JSON) return;
@@ -678,26 +696,83 @@ async function startSocket() {
       const reason = new Boom(lastDisconnect?.error)?.output?.statusCode;
       connectionState = 'disconnected';
 
-      if (reason === DisconnectReason.loggedOut) {
+      // A connection that never lasted SUSTAINED_CONNECTION_MS does not count
+      // as a recovery, so cancel the pending reset and keep the budget.
+      if (sustainedConnectionTimer) {
+        clearTimeout(sustainedConnectionTimer);
+        sustainedConnectionTimer = null;
+      }
+
+      const disconnectClass = classifyDisconnect(reason);
+      reconnectAttemptsByClass[disconnectClass] =
+        (reconnectAttemptsByClass[disconnectClass] || 0) + 1;
+      reconnectAttemptsTotal += 1;
+      const decision = decideReconnect({
+        reason,
+        attempt: reconnectAttemptsByClass[disconnectClass],
+      });
+      lastReconnectDecision = decision;
+
+      if (decision.action === DisconnectAction.EXIT) {
         emitPairEvent({ event: 'error', error: 'logged_out', reason });
         if (!PAIR_JSON) {
           console.log('❌ Logged out. Delete session and restart to re-authenticate.');
         }
         process.exit(1);
+      } else if (decision.action === DisconnectAction.STOP) {
+        // Budget exhausted for this class. Exit non-zero -- this is the ONLY
+        // signal that reaches the gateway's recovery machinery.
+        //
+        // Do not "improve" this by staying alive and reporting disconnected on
+        // /health: nothing polls /health outside connect(), and /messages keeps
+        // answering 200 [] regardless of connection state, so the gateway would
+        // go on believing WhatsApp was connected until a human noticed.
+        // _check_managed_bridge_exit() watches the PROCESS, once per second,
+        // and is what escalates to a retryable fatal error and a fresh bridge.
+        emitPairEvent({ event: 'error', error: 'reconnect_gave_up', reason });
+        if (!PAIR_JSON) {
+          console.log(
+            `🛑 Giving up after ${decision.attempt - 1} attempt(s) ` +
+            `(reason: ${reason}, classified: ${decision.classification}). ` +
+            `Exiting so the gateway can restart the bridge with a fresh budget.`
+          );
+        }
+        process.exit(1);
       } else {
-        // 515 = restart requested (common after pairing). Always reconnect.
         emitPairEvent({ event: 'disconnected', reason });
         if (!PAIR_JSON) {
-          if (reason === 515) {
-            console.log('↻ WhatsApp requested restart (code 515). Reconnecting...');
+          const secs = (decision.delayMs / 1000).toFixed(1);
+          if (decision.classification === 'restart_required') {
+            console.log(`↻ WhatsApp requested restart (code 515). Reconnecting in ${secs}s...`);
           } else {
-            console.log(`⚠️  Connection closed (reason: ${reason}). Reconnecting in 3s...`);
+            console.log(
+              `⚠️  Connection closed (reason: ${reason}, ${decision.classification}). ` +
+              `Reconnecting in ${secs}s ` +
+              `[attempt ${decision.attempt}/${decision.maxAttempts}]...`
+            );
           }
         }
-        setTimeout(startSocket, reason === 515 ? 1000 : 3000);
+        setTimeout(startSocket, decision.delayMs);
       }
     } else if (connection === 'open') {
       connectionState = 'connected';
+      // Clear the budgets only once the connection has PROVEN itself. A socket
+      // that is accepted and immediately dropped would otherwise reset the
+      // schedule on every cycle and never deplete — ~7s per flap, which is
+      // back in hammering territory. unref() so this timer never by itself
+      // keeps the process alive.
+      if (sustainedConnectionTimer) {
+        clearTimeout(sustainedConnectionTimer);
+      }
+      sustainedConnectionTimer = setTimeout(() => {
+        reconnectAttemptsByClass = Object.create(null);
+        reconnectAttemptsTotal = 0;
+        lastReconnectDecision = null;
+        sustainedConnectionTimer = null;
+      }, SUSTAINED_CONNECTION_MS);
+      if (typeof sustainedConnectionTimer.unref === 'function') {
+        sustainedConnectionTimer.unref();
+      }
       const connectedUser = sock?.user
         ? {
             id: sock.user.id || null,
@@ -1848,6 +1923,11 @@ app.get('/health', (req, res) => {
     uptime: process.uptime(),
     scriptHash: SCRIPT_HASH,
     sendReadReceipts: SEND_READ_RECEIPTS,
+    reconnectAttempts: reconnectAttemptsTotal,
+    reconnectAttemptsByClass: { ...reconnectAttemptsByClass },
+    connectionSettling: sustainedConnectionTimer !== null,
+    lastDisconnectClass: lastReconnectDecision?.classification ?? null,
+    lastDisconnectReason: lastReconnectDecision?.reason ?? null,
   });
 });
 
