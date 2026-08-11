@@ -523,28 +523,91 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         from hermes_constants import get_hermes_home
         return get_hermes_home() / "whatsapp" / "engagements.json"
 
+    @staticmethod
+    def _chat_id_is_aliasable(chat_id: str) -> bool:
+        """True when *chat_id* names a person, so phone/LID aliasing applies.
+
+        Alias resolution is confined to DM identifiers on purpose. A group JID
+        is not a user identity, and normalising it numerically
+        (``120363…@g.us`` → ``120363…``) could collide with a phone number and
+        merge two unrelated chats — an authorization boundary, not a cosmetic
+        difference. Status/newsletter pseudo-chats are excluded for the same
+        reason. Those chats still reach their own window through the exact-key
+        fast path; they simply never expand.
+
+        A suffix test, not a substring test: ``g.us@s.whatsapp.net`` is a DM
+        whose number happens to spell the group suffix.
+        """
+        cid = str(chat_id or "").strip()
+        if not cid:
+            return False
+        if cid.lower().endswith("@g.us"):
+            return False
+        return not WhatsAppAdapter._is_broadcast_chat(cid)
+
     def _engagement_active_for_chat(self, chat_id: str) -> bool:
-        """True if there is a non-expired engagement window for chat_id."""
-        if not chat_id:
-            return False
-        path = self._engagements_path()
-        if not path.exists():
-            return False
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return False
-        window = data.get("windows", {}).get(chat_id)
+        """True if there is a non-expired engagement window for chat_id.
+
+        The lookup itself lives in :meth:`_engagement_record` so phone/LID
+        alias resolution exists in exactly one place; this method only applies
+        the expiry test, unchanged. An aliased window that has expired is
+        therefore still inactive — the alias path resolves *which* window, it
+        never resurrects one.
+        """
+        window = self._engagement_record(chat_id)
         if not window:
             return False
         try:
             expires = datetime.fromisoformat(window["expires_at"])
-        except (KeyError, ValueError):
+        except (KeyError, TypeError, ValueError):
             return False
         return expires > datetime.now(timezone.utc)
 
     def _engagement_record(self, chat_id: str) -> Optional[Dict[str, Any]]:
-        """Return the raw engagement window dict for chat_id, or None."""
+        """Return the raw engagement window dict for chat_id, or None.
+
+        One human has two WhatsApp JID shapes — a phone JID
+        (``<phone>@s.whatsapp.net``) and a mapped ``<lid>@lid`` — and the
+        bridge may open a window under one and deliver replies under the
+        other. This used to be an exact dict lookup, so a window opened under
+        a manually-added contact's phone number never matched that contact's
+        inbound LID and the message was dropped before agent dispatch.
+
+        Resolution order:
+
+        1. **Exact key.** Costs one dict lookup and expands nothing. This is
+           the common case and it must stay free — see the cost note below.
+        2. **Alias match.** ``expand_whatsapp_aliases`` is called **once**, on
+           the inbound ``chat_id``, and each stored window's key and
+           ``chat_id`` are compared against that set by their normalized form.
+           First match in sorted-key order wins, so a tie is deterministic.
+
+        Cost, and why it is shaped this way. ``expand_whatsapp_aliases``
+        measures **18.7 ms per call** on the production box, essentially all of
+        it ``get_hermes_dir`` listing a session directory that grows with every
+        contact (1 file → 0.012 ms, 9,337 files → 18.96 ms). This runs on every
+        observe-only inbound message, so expanding per stored window would add
+        ~19 ms × (1 + windows) of synchronous work to the gateway's event loop
+        per message. Expanding only the inbound id makes it **at most one
+        expansion per message**, independent of how many windows are open, and
+        zero whenever there is no engagements file, no windows, an exact-key
+        hit, or a group/broadcast chat.
+
+        The trap this deliberately avoids: ``expand_whatsapp_aliases`` returns
+        **bare numeric ids, not JIDs** (``normalize_whatsapp_identifier`` ends
+        in ``.split("@", 1)[0]``), so ``"<id>@s.whatsapp.net" in
+        expand_whatsapp_aliases(...)`` is always False. The comparison below is
+        between *normalized* values on both sides.
+
+        Known limit, accepted: the bridge writes ``lid-mapping-<phone>.json``
+        and ``lid-mapping-<lid>_reverse.json`` together, which makes expansion
+        symmetric. Were only one of the pair ever written, expanding the
+        inbound id alone could miss a stored alias that expansion from the
+        *other* side would have found. Expanding both sides costs 2N+1 calls
+        for that case, which is the regression this shape exists to prevent.
+        """
+        if not chat_id:
+            return None
         path = self._engagements_path()
         if not path.exists():
             return None
@@ -552,7 +615,57 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             data = json.loads(path.read_text(encoding="utf-8"))
         except Exception:
             return None
-        return data.get("windows", {}).get(chat_id)
+        windows = data.get("windows") or {}
+        if not isinstance(windows, dict):
+            return None
+
+        # 1. Exact key — no expansion, no import, no directory listing.
+        direct = windows.get(chat_id)
+        if direct:
+            return direct
+
+        # 2. Alias match. Bail before the expensive call whenever it cannot
+        #    possibly produce an answer.
+        if not windows or not self._chat_id_is_aliasable(chat_id):
+            return None
+
+        from gateway.whatsapp_identity import (
+            expand_whatsapp_aliases,
+            normalize_whatsapp_identifier,
+        )
+
+        try:
+            aliases = expand_whatsapp_aliases(chat_id)
+        except Exception:
+            # Degrade to the exact-key behaviour that shipped before this —
+            # known-safe — rather than putting a new failure mode in the
+            # gateway's inbound path.
+            logger.debug(
+                "[%s] alias expansion failed for engagement lookup", self.name,
+                exc_info=True,
+            )
+            return None
+        if not aliases:
+            return None
+
+        # sorted(): a tie must not depend on dict insertion order.
+        for key in sorted(windows):
+            window = windows.get(key)
+            if not window:
+                continue
+            candidates = [key]
+            if isinstance(window, dict):
+                stored_chat_id = window.get("chat_id")
+                if stored_chat_id and stored_chat_id != key:
+                    candidates.append(stored_chat_id)
+            for candidate in candidates:
+                # A stored group window can never be a DM's alias; skipping it
+                # keeps a group whose digits match a phone number out.
+                if not self._chat_id_is_aliasable(candidate):
+                    continue
+                if normalize_whatsapp_identifier(candidate) in aliases:
+                    return window
+        return None
 
     def _effective_reply_prefix(self, chat_id: Optional[str] = None) -> str:
         """Resolve outgoing reply prefix for a given target chat.
