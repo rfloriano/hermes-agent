@@ -415,3 +415,183 @@ def test_alias_expansion_failure_degrades_to_exact_key(tmp_path, monkeypatch):
     assert adapter._engagement_active_for_chat(LID_JID) is False
     # Exact key still works — this is the behaviour that shipped before.
     assert adapter._engagement_active_for_chat(PHONE_JID) is True
+
+
+# ------------------------------------------- single-writer: the hook owns
+# observe_only
+#
+# 2026-08-17 production privacy incident. An engagement window was open on an
+# external contact. Every inbound message he sent was ALSO dispatched into the
+# normal gateway, which did not recognise him and answered with Hermes's canned
+# pairing text:
+#
+#     Hi~ I don't recognize you yet!  Here's your pairing code: ...
+#
+# So the contact learned Rafael runs an agent, and learned it from the agent.
+#
+# The cause was dual routing, not the string. _handle_incoming_event emitted the
+# watcher hook and THEN, when a window was active, dispatched the same event to
+# the normal agent — while the watcher hook has its own complete decision and
+# send path (invoke.invoke_agent_reply -> the bridge's /send). Two writers on
+# one conversation: for an unauthorized contact the second one pairs, and for a
+# contact authorized later it would be a second full agent reply.
+#
+# The fix makes observe_only hook-owned: emitted, then returned on,
+# unconditionally. These tests pin that. They deliberately configure
+# dm_policy="pairing" — the permissive default that produced the incident — so
+# they prove ISOLATION rather than passing because some allowlist happened to
+# reject the sender. `unauthorized_dm_behavior: ignore` is live on the VPS as
+# defence in depth and is deliberately NOT what these tests lean on.
+
+_OBSERVE_DM_POLICY = {"dm_policy": "pairing"}
+
+
+def _observe_adapter(tmp_path, monkeypatch):
+    """Adapter with the permissive DM policy and the agent path fully mocked."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    adapter = WhatsAppAdapter(PlatformConfig(enabled=True, extra=dict(_OBSERVE_DM_POLICY)))
+    adapter._hook_registry = MagicMock()
+    adapter._hook_registry.emit = AsyncMock()
+    adapter._dispatch_to_agent = AsyncMock()
+    # The invariant that actually matters is "nothing left the box". Mocking the
+    # two agent entry points AND the bridge poster means a regression cannot
+    # sneak through by reaching the agent via some path other than
+    # _dispatch_to_agent.
+    adapter.handle_message = AsyncMock()
+    adapter._enqueue_text_event = MagicMock()
+    adapter._bridge_post = AsyncMock(return_value={"ok": True, "message_id": "X"})
+    return adapter
+
+
+def _inbound(chat_id: str, *, observe_only: bool) -> dict:
+    data = {
+        "chatId": chat_id,
+        "senderId": chat_id,
+        "fromMe": False,
+        "isGroup": False,
+        "messageId": "M-observe",
+        "body": "oi, tudo bem?",
+        "timestamp": 1716000000,
+    }
+    if observe_only:
+        data["observe_only"] = True
+    return data
+
+
+def _assert_nothing_reached_the_agent(adapter):
+    adapter._dispatch_to_agent.assert_not_awaited()
+    adapter.handle_message.assert_not_awaited()
+    adapter._enqueue_text_event.assert_not_called()
+    adapter._bridge_post.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_active_window_observe_only_is_hook_owned(tmp_path, monkeypatch):
+    """The incident, inverted: an ACTIVE window must not add a second writer."""
+    _engagements_file(tmp_path, {PHONE_JID: _window(PHONE_JID)})
+    adapter = _observe_adapter(tmp_path, monkeypatch)
+    data = _inbound(PHONE_JID, observe_only=True)
+
+    await adapter._handle_incoming_event(data)
+
+    # The watcher still sees everything — archiving and the engagement reply
+    # both depend on it.
+    adapter._hook_registry.emit.assert_awaited_once_with("message:received", data)
+    _assert_nothing_reached_the_agent(adapter)
+
+
+@pytest.mark.asyncio
+async def test_active_window_observe_only_via_lid_alias_is_hook_owned(
+    tmp_path, monkeypatch
+):
+    """The production shape exactly: window on the phone JID, reply as a LID.
+
+    Worth its own test because the alias path is what made the window resolve
+    as ACTIVE in the first place — before the phone/LID fix these messages were
+    dropped, which accidentally hid the dual-writer bug for LID-keyed contacts.
+    """
+    _link(tmp_path, PHONE, LID)
+    _engagements_file(tmp_path, {PHONE_JID: _window(PHONE_JID)})
+    adapter = _observe_adapter(tmp_path, monkeypatch)
+    data = _inbound(LID_JID, observe_only=True)
+
+    # Precondition: this really is the active-window branch, not a silent miss.
+    assert adapter._engagement_active_for_chat(LID_JID) is True
+
+    await adapter._handle_incoming_event(data)
+
+    adapter._hook_registry.emit.assert_awaited_once_with("message:received", data)
+    _assert_nothing_reached_the_agent(adapter)
+
+
+@pytest.mark.asyncio
+async def test_inactive_window_observe_only_still_reaches_the_hook(
+    tmp_path, monkeypatch
+):
+    """No window: unchanged behaviour, and the archive must still get it."""
+    _engagements_file(tmp_path, {})
+    adapter = _observe_adapter(tmp_path, monkeypatch)
+    data = _inbound(PHONE_JID, observe_only=True)
+
+    await adapter._handle_incoming_event(data)
+
+    adapter._hook_registry.emit.assert_awaited_once_with("message:received", data)
+    _assert_nothing_reached_the_agent(adapter)
+
+
+@pytest.mark.asyncio
+async def test_expired_window_observe_only_is_hook_owned(tmp_path, monkeypatch):
+    """An expired window is not a licence to dispatch either."""
+    _engagements_file(tmp_path, {PHONE_JID: _window(PHONE_JID, _past())})
+    adapter = _observe_adapter(tmp_path, monkeypatch)
+    data = _inbound(PHONE_JID, observe_only=True)
+
+    await adapter._handle_incoming_event(data)
+
+    adapter._hook_registry.emit.assert_awaited_once_with("message:received", data)
+    _assert_nothing_reached_the_agent(adapter)
+
+
+@pytest.mark.asyncio
+async def test_non_observe_only_dm_still_reaches_the_agent(tmp_path, monkeypatch):
+    """Positive control — without it every assertion above could pass vacuously.
+
+    A normal (non-observe_only) DM under the same permissive policy must still
+    run the ordinary gateway path. The fix narrows observe_only ONLY.
+    """
+    _engagements_file(tmp_path, {PHONE_JID: _window(PHONE_JID)})
+    adapter = _observe_adapter(tmp_path, monkeypatch)
+    data = _inbound(PHONE_JID, observe_only=False)
+
+    await adapter._handle_incoming_event(data)
+
+    adapter._hook_registry.emit.assert_awaited_once_with("message:received", data)
+    adapter._dispatch_to_agent.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_observe_only_gating_does_not_read_the_engagement_store(
+    tmp_path, monkeypatch
+):
+    """Returning early must not cost an engagement lookup — or an expansion.
+
+    Beyond speed this is the structural point of the fix: the dispatch decision
+    for an observe_only event no longer depends on engagement state at all, so
+    it cannot be re-coupled to it by accident.
+    """
+    _link(tmp_path, PHONE, LID)
+    _engagements_file(tmp_path, {PHONE_JID: _window(PHONE_JID)})
+    adapter = _observe_adapter(tmp_path, monkeypatch)
+    calls = _count_expansions(monkeypatch)
+    probed = []
+    monkeypatch.setattr(
+        adapter, "_engagement_active_for_chat",
+        lambda chat_id: probed.append(chat_id) or True,
+    )
+
+    await adapter._handle_incoming_event(_inbound(LID_JID, observe_only=True))
+
+    assert probed == [], "observe_only dispatch must not consult engagement state"
+    assert calls == []

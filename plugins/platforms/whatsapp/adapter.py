@@ -707,7 +707,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
 
         Steps (in order):
         1. Emit message:received hook (always, before any gating).
-        2. If observe_only and no active engagement window, return early.
+        2. If observe_only, return — the hook owns these events outright.
         3. Dispatch to agent (the DM/group/mention policy gate lives inside
            _build_message_event, which _dispatch_to_agent calls).
         """
@@ -718,10 +718,33 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             except Exception:
                 logger.exception("[%s] message:received hook raised", self.name)
 
-        # 2. Observe-only messages only reach the agent if an engagement is active.
+        # 2. Observe-only events belong to the hook and to nothing else.
+        #
+        # This used to read "return UNLESS an engagement window is active",
+        # which made an open window a second writer on the conversation rather
+        # than the single owner of it. The watcher hook already holds a
+        # complete decision-and-send path of its own (invoke.invoke_agent_reply
+        # -> the bridge's /send), so dispatching the same event onward gave the
+        # chat two independent authors.
+        #
+        # On 2026-08-17 that shipped an external contact Hermes's canned
+        # unauthorized-DM pairing text ("Hi~ I don't recognize you yet! Here's
+        # your pairing code: ...") in the middle of an engagement — the normal
+        # gateway did not recognise him, and answered on its own. He learned
+        # the account was automated, from the automation. Had he instead been
+        # an authorized user, the same routing would have produced two full
+        # agent replies to one message.
+        #
+        # The bridge already calls these events "historical — don't engage the
+        # agent" (scripts/whatsapp-bridge/bridge.js), so returning here is the
+        # observe-only contract restored, not a new restriction. Note this is
+        # deliberately unconditional: the dispatch decision no longer depends
+        # on engagement state at all, which is what stops the two from being
+        # re-coupled by a later edit. `whatsapp.unauthorized_dm_behavior:
+        # ignore` on the VPS is defence in depth behind this, not a substitute
+        # for it — it would not have stopped the duplicate-reply half.
         if data.get("observe_only"):
-            if not self._engagement_active_for_chat(data.get("chatId", "")):
-                return
+            return
 
         # 3. Dispatch to agent.
         #
