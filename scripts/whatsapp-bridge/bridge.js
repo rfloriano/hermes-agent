@@ -588,6 +588,84 @@ const TYPING_CFG = {
   max: Number(process.env.WHATSAPP_TYPING_MAX_SECONDS ?? 8),
 };
 
+// --- presence lifecycle -------------------------------------------------
+//
+// THE BUG THIS EXISTS TO FIX (2026-08-17): Rafael showed as permanently
+// "online" on WhatsApp to every contact.
+//
+// WhatsApp will not accept a chat-state ('composing'/'paused') unless the
+// session is AVAILABLE, so sending a typing indicator implicitly marks the
+// account ONLINE. 'paused' only clears the "typing…" text — it does NOT undo
+// that. This bridge never sent 'unavailable' anywhere, so the first outbound
+// message after a socket connected left the account online for the life of
+// that socket. That is a continuous, passive broadcast of exactly when the
+// agent is running, to everyone in Rafael's contact list.
+//
+// `markOnlineOnConnect: false` (see makeWASocket below) keeps a freshly
+// connected socket offline. This is the other half of that same contract:
+// whatever takes us online has to put us back.
+//
+// Implemented as a DEBOUNCED timer rather than an inline await because the
+// three call sites have different shapes — a send follows 'paused'
+// immediately, while POST /typing may never be followed by a send at all
+// (the agent can decide not to reply). A timer covers all of them with one
+// rule and cannot strand the session online.
+const PRESENCE_OFFLINE_MS = Number(process.env.WHATSAPP_PRESENCE_OFFLINE_MS ?? 3000);
+const PRESENCE_TYPING_MAX_MS = Number(process.env.WHATSAPP_PRESENCE_TYPING_MAX_MS ?? 30000);
+
+let presenceOfflineTimer = null;
+
+/** Cancel any pending go-offline. */
+function cancelPresenceOffline() {
+  if (presenceOfflineTimer) {
+    clearTimeout(presenceOfflineTimer);
+    presenceOfflineTimer = null;
+  }
+}
+
+/**
+ * Arm (or re-arm) the go-offline timer. Debounced: later presence activity
+ * pushes the deadline out rather than stacking timers.
+ *
+ * NEVER throws and never rejects a caller: presence is bookkeeping, and a
+ * failure here must not fail the message that triggered it.
+ * @param {object} sock
+ * @param {number} [ms]
+ */
+export function schedulePresenceOffline(sock, ms = PRESENCE_OFFLINE_MS) {
+  cancelPresenceOffline();
+  presenceOfflineTimer = setTimeout(async () => {
+    presenceOfflineTimer = null;
+    try {
+      await sock.sendPresenceUpdate('unavailable');
+    } catch (err) {
+      // Socket may have dropped in the meantime; a reconnect starts offline
+      // anyway thanks to markOnlineOnConnect:false, so there is nothing to
+      // recover here.
+    }
+  }, ms);
+  // unref so a pending presence timer never keeps the process alive.
+  if (presenceOfflineTimer.unref) presenceOfflineTimer.unref();
+}
+
+/**
+ * Send a chat-state and keep the offline contract.
+ *
+ * 'composing' gets the long deadline — the agent may be thinking for a while
+ * and we must not go offline mid-typing. 'paused' gets the short one, because
+ * the send fires immediately after it.
+ * @param {object} sock
+ * @param {'composing'|'paused'} state
+ * @param {string} chatId
+ */
+export async function sendChatState(sock, state, chatId) {
+  await sock.sendPresenceUpdate(state, chatId);
+  schedulePresenceOffline(
+    sock,
+    state === 'composing' ? PRESENCE_TYPING_MAX_MS : PRESENCE_OFFLINE_MS,
+  );
+}
+
 /**
  * Compute how many seconds to show the typing indicator before sending.
  * Scales linearly with message length, clamped to [cfg.min, cfg.max].
@@ -615,10 +693,10 @@ export function computeTypingSeconds(text, cfg = TYPING_CFG) {
 async function performTypingAndSend(sock, chatId, text, opts = {}) {
   const typingEnabled = opts.typingEnabled !== false && TYPING_CFG.enabled !== false;
   if (typingEnabled) {
-    await sock.sendPresenceUpdate('composing', chatId);
+    await sendChatState(sock, 'composing', chatId);
     const secs = opts.typingSeconds ?? computeTypingSeconds(text);
     await sleep(secs * 1000);
-    await sock.sendPresenceUpdate('paused', chatId);
+    await sendChatState(sock, 'paused', chatId);
   }
   // `text` is used only for the typing-duration calc. The actual payload sent
   // defaults to a plain text message, but callers that need a richer payload
@@ -1356,10 +1434,10 @@ app.post('/send-media', async (req, res) => {
     // typing indicator before media send (uses caption text for duration calc)
     const typingEnabled_ = typingEnabled !== false && TYPING_CFG.enabled !== false;
     if (typingEnabled_) {
-      await sock.sendPresenceUpdate('composing', chatId);
+      await sendChatState(sock, 'composing', chatId);
       const secs = typingSeconds ?? computeTypingSeconds(caption || '');
       await sleep(secs * 1000);
-      await sock.sendPresenceUpdate('paused', chatId);
+      await sendChatState(sock, 'paused', chatId);
     }
 
     if (!existsSync(filePath)) {
@@ -1508,7 +1586,7 @@ app.post('/typing', async (req, res) => {
   if (!chatId) return res.status(400).json({ error: 'chatId required' });
 
   try {
-    await sock.sendPresenceUpdate('composing', chatId);
+    await sendChatState(sock, 'composing', chatId);
     res.json({ success: true });
   } catch (err) {
     res.json({ success: false });
