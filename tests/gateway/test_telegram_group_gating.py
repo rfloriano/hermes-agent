@@ -691,11 +691,28 @@ def _group_voice_message(
 
 
 # ---------------------------------------------------------------------------
-# Observe + attribution parity: location messages
+# Location messages: observed through the hook registry, never dispatched
 # ---------------------------------------------------------------------------
 
 
-def test_triggered_location_message_uses_shared_session_in_observe_mode():
+class _RecordingHookRegistry:
+    def __init__(self):
+        self.events = []
+
+    async def emit_collect(self, event_type, context=None):
+        self.events.append((event_type, context))
+        return [{"stored": True}]
+
+
+def test_triggered_location_message_is_observed_by_hook_without_agent_dispatch():
+    """A triggered group location reaches the hook with real attribution.
+
+    Location updates never start an agent turn (see
+    tests/gateway/test_telegram_location_hook.py for the live-location
+    stream). In a group the record keeps the sender's own identity rather
+    than the shared-session attribution text: the hook is a history, not a
+    transcript, and it needs to know whose point this is.
+    """
     async def _run():
         adapter = _make_adapter(
             require_mention=False,
@@ -703,6 +720,8 @@ def test_triggered_location_message_uses_shared_session_in_observe_mode():
             observe_unmentioned_group_messages=True,
         )
         adapter.handle_message = AsyncMock()
+        registry = _RecordingHookRegistry()
+        adapter.set_hook_registry(registry)
         update = SimpleNamespace(
             update_id=2002,
             message=_group_location_message(),
@@ -711,10 +730,14 @@ def test_triggered_location_message_uses_shared_session_in_observe_mode():
 
         await adapter._handle_location_message(update, SimpleNamespace())
 
-        adapter.handle_message.assert_awaited_once()
-        event = adapter.handle_message.call_args[0][0]
-        assert event.source.user_id is None
-        assert "[Alice Example|111]" in event.text
+        adapter.handle_message.assert_not_awaited()
+        adapter._message_handler.assert_not_awaited()
+        assert [name for name, _ in registry.events] == ["telegram:location"]
+        record = registry.events[0][1]
+        assert record["chat_id"] == "-100" and record["chat_type"] == "group"
+        assert record["user_id"] == "111" and record["user_name"] == "Alice Example"
+        assert record["latitude"] == 37.7749 and record["longitude"] == -122.4194
+        assert record["update_id"] == 2002 and record["message_id"] == "50"
 
     asyncio.run(_run())
 

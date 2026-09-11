@@ -9879,8 +9879,121 @@ class TelegramAdapter(BasePlatformAdapter):
             return
         await self.handle_message(event)
 
+    # ------------------------------------------------------------------
+    # Location updates: observed, never dispatched
+    # ------------------------------------------------------------------
+
+    # Event emitted to the gateway HookRegistry for every authorised location
+    # or venue message. ``_hook_registry`` is injected by
+    # ``GatewayRunner._attach_hook_registry`` (the same seam the WhatsApp
+    # adapter uses); the class default keeps ``__new__``-built adapters safe.
+    TELEGRAM_LOCATION_HOOK_EVENT = "telegram:location"
+    _hook_registry = None
+
+    def set_hook_registry(self, registry) -> None:
+        """Inject the gateway HookRegistry so this adapter can emit hooks."""
+        self._hook_registry = registry
+
+    @staticmethod
+    def _finite_float(value: Any) -> Optional[float]:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        if number != number or number in (float("inf"), float("-inf")):
+            return None
+        return number
+
+    @staticmethod
+    def _int_or_none(value: Any) -> Optional[int]:
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _iso_or_none(value: Any) -> Optional[str]:
+        if value is None or not hasattr(value, "isoformat"):
+            return None
+        try:
+            return str(value.isoformat())
+        except Exception:
+            return None
+
+    def _build_location_record(
+        self,
+        msg: Message,
+        update: Update,
+        event: MessageEvent,
+    ) -> Optional[Dict[str, Any]]:
+        """Structured, JSON-serialisable view of a location/venue message.
+
+        Returns ``None`` when the message carries no usable coordinates.
+        Identity fields come from ``event.source`` so the record agrees with
+        the rest of the gateway on chat/user/thread ids.
+        """
+        venue = getattr(msg, "venue", None)
+        location = getattr(venue, "location", None) if venue else getattr(msg, "location", None)
+        if not location:
+            return None
+        lat = self._finite_float(getattr(location, "latitude", None))
+        lon = self._finite_float(getattr(location, "longitude", None))
+        if lat is None or lon is None:
+            return None
+
+        source = event.source
+        date = getattr(msg, "date", None)
+        edit_date = getattr(msg, "edit_date", None)
+        captured_at = self._iso_or_none(edit_date or date) or datetime.now(tz=timezone.utc).isoformat()
+
+        record: Dict[str, Any] = {
+            "platform": "telegram",
+            "kind": "venue" if venue else "location",
+            "chat_id": getattr(source, "chat_id", None),
+            "chat_type": getattr(source, "chat_type", None),
+            "chat_name": getattr(source, "chat_name", None),
+            "thread_id": getattr(source, "thread_id", None),
+            "user_id": getattr(source, "user_id", None),
+            "user_name": getattr(source, "user_name", None),
+            "message_id": str(event.message_id) if event.message_id is not None else None,
+            "update_id": getattr(update, "update_id", None),
+            "is_edit": getattr(update, "edited_message", None) is not None,
+            "latitude": lat,
+            "longitude": lon,
+            "horizontal_accuracy": self._finite_float(getattr(location, "horizontal_accuracy", None)),
+            "heading": self._int_or_none(getattr(location, "heading", None)),
+            "live_period": self._int_or_none(getattr(location, "live_period", None)),
+            "proximity_alert_radius": self._int_or_none(getattr(location, "proximity_alert_radius", None)),
+            "date": self._iso_or_none(date),
+            "edit_date": self._iso_or_none(edit_date),
+            "captured_at": captured_at,
+        }
+        if venue:
+            record["venue"] = {
+                "title": getattr(venue, "title", None),
+                "address": getattr(venue, "address", None),
+                "foursquare_id": getattr(venue, "foursquare_id", None),
+                "google_place_id": getattr(venue, "google_place_id", None),
+            }
+        return record
+
     async def _handle_location_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle incoming location/venue pin messages."""
+        """Observe location/venue messages without dispatching an agent turn.
+
+        A Telegram live location is one message followed by a stream of
+        ``edited_message`` updates, one per coordinate refresh, and every one
+        of them matches ``filters.LOCATION``. Dispatching each through
+        ``handle_message`` started an LLM turn per refresh -- interrupting
+        whatever turn was in flight and asking, again, what the user wanted
+        to find nearby.
+
+        Location is ambient context, not a request. Every authorised update
+        is handed to the gateway hook registry as ``telegram:location`` (a
+        hook persists the trail and answers questions about it on demand) and
+        the agent is left alone. Authorisation and group gating are unchanged.
+        """
         msg = self._effective_update_message(update)
         if not msg:
             return
@@ -9896,35 +10009,29 @@ class TelegramAdapter(BasePlatformAdapter):
                 self._observe_unmentioned_group_message(msg, MessageType.LOCATION, update_id=update.update_id)
             return
 
-        venue = getattr(msg, "venue", None)
-        location = getattr(venue, "location", None) if venue else getattr(msg, "location", None)
-
-        if not location:
-            return
-
-        lat = getattr(location, "latitude", None)
-        lon = getattr(location, "longitude", None)
-        if lat is None or lon is None:
-            return
-
-        # Build a text message with coordinates and context
-        parts = ["[The user shared a location pin.]"]
-        if venue:
-            title = getattr(venue, "title", None)
-            address = getattr(venue, "address", None)
-            if title:
-                parts.append(f"Venue: {title}")
-            if address:
-                parts.append(f"Address: {address}")
-        parts.append(f"latitude: {lat}")
-        parts.append(f"longitude: {lon}")
-        parts.append(f"Map: https://www.google.com/maps/search/?api=1&query={lat},{lon}")
-        parts.append("Ask what they'd like to find nearby (restaurants, cafes, etc.) and any preferences.")
-
         event = self._build_message_event(msg, MessageType.LOCATION, update_id=update.update_id)
-        event.text = "\n".join(parts)
-        event = self._apply_telegram_group_observe_attribution(event)
-        await self.handle_message(event)
+        record = self._build_location_record(msg, update, event)
+        if record is None:
+            return
+
+        consumers = 0
+        registry = getattr(self, "_hook_registry", None)
+        if registry is not None:
+            try:
+                consumers = len(await registry.emit_collect(self.TELEGRAM_LOCATION_HOOK_EVENT, record))
+            except Exception:
+                logger.exception("[Telegram] %s hook raised", self.TELEGRAM_LOCATION_HOOK_EVENT)
+        # Identifiers only: coordinates are personal data and stay out of logs.
+        logger.info(
+            "[Telegram] Location update observed without agent dispatch: "
+            "chat=%s message=%s update=%s edit=%s live=%s consumers=%d",
+            record["chat_id"],
+            record["message_id"],
+            record["update_id"],
+            record["is_edit"],
+            record["live_period"] is not None,
+            consumers,
+        )
 
     # ------------------------------------------------------------------
     # Text message aggregation (handles Telegram client-side splits)
