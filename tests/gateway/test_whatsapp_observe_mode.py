@@ -14,6 +14,34 @@ from plugins.platforms.whatsapp.adapter import WhatsAppAdapter
 from gateway.platforms.base import PlatformConfig
 
 
+@pytest.fixture(autouse=True)
+def _isolate_whatsapp_policy_env(monkeypatch):
+    """Neutralise WHATSAPP_* policy vars leaked into os.environ by other suites.
+
+    Upstream's own tests/gateway/test_whatsapp_group_gating.py
+    ::test_config_bridges_whatsapp_dm_and_group_policy exercises the
+    config-to-env bridging path, which writes WHATSAPP_DM_POLICY,
+    WHATSAPP_GROUP_POLICY and WHATSAPP_GROUP_ALLOWED_USERS straight into
+    os.environ rather than through monkeypatch -- so they survive its
+    teardown. extra_or_secret() gives the env precedence over config.extra,
+    so a leaked WHATSAPP_DM_POLICY='disabled' silently overrides the
+    dm_policy='pairing' fixtures below and turns the positive controls red
+    whenever that file happens to run first.
+
+    Confirmed against pristine upstream 0.21.3 with no fork code present, so
+    this is an upstream isolation leak, not a regression in the watcher.
+    Pinned here because these tests guard a SILENT failure mode: one that
+    goes red for unrelated reasons is one people learn to ignore.
+    """
+    for var in (
+        "WHATSAPP_DM_POLICY",
+        "WHATSAPP_GROUP_POLICY",
+        "WHATSAPP_GROUP_ALLOWED_USERS",
+        "WHATSAPP_ALLOWED_USERS",
+    ):
+        monkeypatch.delenv(var, raising=False)
+
+
 # Policy fixtures used by the intake-gate regression tests below.
 # "pairing" accepts every DM unconditionally; "allowlist" with an empty
 # allow_from rejects every DM. Together they give a positive/negative control
