@@ -1108,7 +1108,22 @@ class GatewayAdapterLifecycleMixin:
             authorization_check or self._make_adapter_auth_check(adapter.platform)
         )
         adapter.set_platform_event_handler(platform_event_handler or self._primary_platform_event_handler())
+        self._attach_hook_registry(adapter)
         adapter._busy_text_mode = (self._busy_text_mode if busy_text_mode is None else busy_text_mode)
+
+    def _attach_hook_registry(self, adapter: BasePlatformAdapter) -> None:
+        """Wire the hook registry into an adapter when both sides support it.
+
+        Guards ``self.hooks`` as well as the adapter method: adapters are also
+        configured from code paths that build a runner via ``__new__`` (upstream
+        does this in tests), where ``__init__`` never ran and ``hooks`` is unset.
+        """
+        hooks = getattr(self, "hooks", None)
+        if hooks is None:
+            return
+        _set_hooks = getattr(adapter, "set_hook_registry", None)
+        if callable(_set_hooks):
+            _set_hooks(hooks)
 
     def _configure_profile_adapter(
         self, adapter: BasePlatformAdapter, profile_name: str, platform: Platform
