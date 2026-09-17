@@ -314,7 +314,7 @@ class GatewayVoiceMixin:
     def _should_echo_stt_transcripts(self) -> bool:
         return bool(getattr(self.config, "stt_echo_transcripts", True))
 
-    async def _send_voice_reply(self, event: MessageEvent, text: str) -> None:
+    async def _send_voice_reply(self, event: MessageEvent, text: str) -> bool:
         """Generate TTS audio and send as a voice message before the text reply. The TTS tool
         may return one combined file or several separately valid ones (combination unavailable /
         over a platform limit); legacy single-file results keep working."""
@@ -324,7 +324,7 @@ class GatewayVoiceMixin:
             from tools.tts_tool import text_to_speech_tool
             tts_text = _strip_markdown_for_tts(text)
             if not tts_text:
-                return
+                return False
             # Platforms whose native voice bubbles require Ogg/Opus (OPUS_VOICE_PLATFORMS) get an
             # explicit .ogg path; the TTS tool's container repair guarantees real Ogg/Opus bytes.
             audio_path = build_auto_tts_output_path(event.source.platform)
@@ -335,23 +335,25 @@ class GatewayVoiceMixin:
             except (json.JSONDecodeError, TypeError):
                 logger.warning("Auto voice reply TTS returned invalid JSON: %s",
                                raw[:200] if raw else raw)
-                return
+                return False
             candidates = result.get("file_paths") or [result.get("file_path", audio_path)]
             paths = [str(p) for p in candidates if p and os.path.isfile(p)]
             if not result.get("success") or not paths:
                 logger.warning("Auto voice reply TTS failed: %s", result.get("error"))
-                return
+                return False
             actual_paths = paths
-            await self._deliver_voice_reply(event, actual_paths)
+            return await self._deliver_voice_reply(event, actual_paths)
         except Exception as e:
             logger.warning("Auto voice reply failed: %s", e, exc_info=True)
+            return False
         finally:
             for p in ({audio_path, *actual_paths} - {None}):
                 with suppress(OSError):
                     os.unlink(p)
 
-    async def _deliver_voice_reply(self, event: MessageEvent, audio_paths: List[str]) -> None:
-        """Play the files in the connected voice channel, else send them as voice messages."""
+    async def _deliver_voice_reply(self, event: MessageEvent, audio_paths: List[str]) -> bool:
+        """Play the files in the connected voice channel, else send them as voice messages.
+        Returns whether anything was dispatched, so /tts can report delivery."""
         adapter = self._adapter_for_source(event.source)
         guild_id = self._get_guild_id(event)
         play = getattr(adapter, "play_in_voice_channel", None)
@@ -359,9 +361,9 @@ class GatewayVoiceMixin:
         if guild_id and callable(play) and callable(is_in_vc) and is_in_vc(guild_id):
             for path in audio_paths:
                 await play(guild_id, path)
-            return
+            return bool(audio_paths)
         if not callable(send_voice := getattr(adapter, "send_voice", None)):
-            return
+            return False
         reply_anchor = self._reply_anchor_for_event(event)
         # notify=True mirrors the final-text path in platforms/base.py so notification-gating
         # adapters (Telegram "important" mode) deliver it. Clone: shared w/ typing-indicator state.
@@ -370,3 +372,4 @@ class GatewayVoiceMixin:
         for path in audio_paths:
             await send_voice(chat_id=event.source.chat_id, audio_path=path, reply_to=reply_anchor,
                              metadata=thread_meta)
+        return bool(audio_paths)

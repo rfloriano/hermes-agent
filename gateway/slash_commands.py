@@ -673,6 +673,20 @@ class GatewaySlashCommandsMixin(
         channels = t("gateway.voice.help_channels") if supports_voice_channels else ""
         return t("gateway.voice.help", toggle=toggle_line, channels=channels)
 
+    async def _handle_tts_command(self, event: MessageEvent) -> str:
+        """Handle /tts <text>: synthesize text and send it as a voice message."""
+        text = event.get_command_args().strip()
+        if not text:
+            return "Usage: /tts <text>"
+
+        send_voice_reply = getattr(self, "_send_voice_reply", None)
+        if send_voice_reply is None:
+            return "TTS não está disponível neste gateway."
+        sent = await send_voice_reply(event, text)
+        if sent:
+            return ""
+        return "Não consegui gerar ou enviar o áudio TTS."
+
     async def _handle_rollback_command(self, event: MessageEvent) -> str:
         """Handle /rollback command — list or restore filesystem checkpoints."""
         from tools.checkpoint_manager import format_checkpoint_list

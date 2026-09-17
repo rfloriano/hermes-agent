@@ -203,6 +203,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
                desktop="composer-voice"),
     CommandDef("wake", "Toggle the 'Hey Hermes' wake word listener", "Configuration",
                cli_only=True, args_hint="[on|off|status]", subcommands=("on", "off", "status")),
+    CommandDef("tts", "Send text as a voice message", "Configuration",
+               gateway_only=True, args_hint="<text>"),
     CommandDef("busy", "Control how messages behave while Hermes is working", "Configuration",
                args_hint="[queue|steer|interrupt|status]",
                subcommands=("queue", "steer", "interrupt", "status"),
