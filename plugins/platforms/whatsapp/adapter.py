@@ -2,6 +2,7 @@
 client; messages are polled over a local HTTP API and responses are posted back through it."""
 
 import asyncio
+import json
 import logging
 import mimetypes
 import os
@@ -10,6 +11,7 @@ import re
 import signal
 import subprocess
 from contextlib import suppress
+from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path
 from typing import Dict, Optional, Any
@@ -283,6 +285,8 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         self._bridge_log_fh = self._bridge_log = self._poll_task = self._http_session = None
         # Set by disconnect() before SIGTERMing so _check_managed_bridge_exit() can tell an intentional exit (-15/-2/0) from a crash.
         self._shutting_down = False
+        # Optional hook registry injected by the gateway after construction.
+        self._hook_registry = None
         # Text debounce batching: rapid bursts (forwards, paste-splits) would otherwise each trigger a separate agent turn.
         self._text_batch_delay_seconds = self._coerce_float_extra("text_batch_delay_seconds", 5.0)
         self._text_batch_split_delay_seconds = self._coerce_float_extra("text_batch_split_delay_seconds", 10.0)
@@ -295,6 +299,277 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         except (TypeError, ValueError):
             return float(default)
         return parsed if math.isfinite(parsed) and parsed >= 0 else float(default)
+
+    def set_hook_registry(self, registry) -> None:
+        """Inject the gateway HookRegistry so hooks can be emitted."""
+        self._hook_registry = registry
+
+    # ------------------------------------------------------------------
+    # Engagement window helpers (engagements.json is written by the
+    # whatsapp-watcher hook)
+    # ------------------------------------------------------------------
+
+    def _engagements_path(self) -> Path:
+        from hermes_constants import get_hermes_home
+        return get_hermes_home() / "whatsapp" / "engagements.json"
+
+    @staticmethod
+    def _chat_id_is_aliasable(chat_id: str) -> bool:
+        """True when *chat_id* names a person, so phone/LID aliasing applies.
+
+        Alias resolution is confined to DM identifiers on purpose. A group JID
+        is not a user identity, and normalising it numerically
+        (``120363…@g.us`` → ``120363…``) could collide with a phone number and
+        merge two unrelated chats — an authorization boundary, not a cosmetic
+        difference. Status/newsletter pseudo-chats are excluded for the same
+        reason. Those chats still reach their own window through the exact-key
+        fast path; they simply never expand.
+
+        A suffix test, not a substring test: ``g.us@s.whatsapp.net`` is a DM
+        whose number happens to spell the group suffix.
+        """
+        cid = str(chat_id or "").strip()
+        if not cid:
+            return False
+        if cid.lower().endswith("@g.us"):
+            return False
+        return not WhatsAppAdapter._is_broadcast_chat(cid)
+
+    def _engagement_active_for_chat(self, chat_id: str) -> bool:
+        """True if there is a non-expired engagement window for chat_id.
+
+        The lookup itself lives in :meth:`_engagement_record` so phone/LID
+        alias resolution exists in exactly one place; this method only applies
+        the expiry test, unchanged. An aliased window that has expired is
+        therefore still inactive — the alias path resolves *which* window, it
+        never resurrects one.
+        """
+        window = self._engagement_record(chat_id)
+        if not window:
+            return False
+        try:
+            expires = datetime.fromisoformat(window["expires_at"])
+        except (KeyError, TypeError, ValueError):
+            return False
+        return expires > datetime.now(timezone.utc)
+
+    def _engagement_record(self, chat_id: str) -> Optional[Dict[str, Any]]:
+        """Return the raw engagement window dict for chat_id, or None.
+
+        One human has two WhatsApp JID shapes — a phone JID
+        (``<phone>@s.whatsapp.net``) and a mapped ``<lid>@lid`` — and the
+        bridge may open a window under one and deliver replies under the
+        other. This used to be an exact dict lookup, so a window opened under
+        a manually-added contact's phone number never matched that contact's
+        inbound LID and the message was dropped before agent dispatch.
+
+        Resolution order:
+
+        1. **Exact key.** Costs one dict lookup and expands nothing. This is
+           the common case and it must stay free — see the cost note below.
+        2. **Alias match.** ``expand_whatsapp_aliases`` is called **once**, on
+           the inbound ``chat_id``, and each stored window's key and
+           ``chat_id`` are compared against that set by their normalized form.
+           First match in sorted-key order wins, so a tie is deterministic.
+
+        Cost, and why it is shaped this way. ``expand_whatsapp_aliases``
+        measures **18.7 ms per call** on the production box, essentially all of
+        it ``get_hermes_dir`` listing a session directory that grows with every
+        contact (1 file → 0.012 ms, 9,337 files → 18.96 ms). This runs on every
+        observe-only inbound message, so expanding per stored window would add
+        ~19 ms × (1 + windows) of synchronous work to the gateway's event loop
+        per message. Expanding only the inbound id makes it **at most one
+        expansion per message**, independent of how many windows are open, and
+        zero whenever there is no engagements file, no windows, an exact-key
+        hit, or a group/broadcast chat.
+
+        The trap this deliberately avoids: ``expand_whatsapp_aliases`` returns
+        **bare numeric ids, not JIDs** (``normalize_whatsapp_identifier`` ends
+        in ``.split("@", 1)[0]``), so ``"<id>@s.whatsapp.net" in
+        expand_whatsapp_aliases(...)`` is always False. The comparison below is
+        between *normalized* values on both sides.
+
+        Known limit, accepted: the bridge writes ``lid-mapping-<phone>.json``
+        and ``lid-mapping-<lid>_reverse.json`` together, which makes expansion
+        symmetric. Were only one of the pair ever written, expanding the
+        inbound id alone could miss a stored alias that expansion from the
+        *other* side would have found. Expanding both sides costs 2N+1 calls
+        for that case, which is the regression this shape exists to prevent.
+        """
+        if not chat_id:
+            return None
+        path = self._engagements_path()
+        if not path.exists():
+            return None
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        windows = data.get("windows") or {}
+        if not isinstance(windows, dict):
+            return None
+
+        # 1. Exact key — no expansion, no import, no directory listing.
+        direct = windows.get(chat_id)
+        if direct:
+            return direct
+
+        # 2. Alias match. Bail before the expensive call whenever it cannot
+        #    possibly produce an answer.
+        if not windows or not self._chat_id_is_aliasable(chat_id):
+            return None
+
+        from gateway.whatsapp_identity import (
+            expand_whatsapp_aliases,
+            normalize_whatsapp_identifier,
+        )
+
+        try:
+            aliases = expand_whatsapp_aliases(chat_id)
+        except Exception:
+            # Degrade to the exact-key behaviour that shipped before this —
+            # known-safe — rather than putting a new failure mode in the
+            # gateway's inbound path.
+            logger.debug(
+                "[%s] alias expansion failed for engagement lookup", self.name,
+                exc_info=True,
+            )
+            return None
+        if not aliases:
+            return None
+
+        # sorted(): a tie must not depend on dict insertion order.
+        for key in sorted(windows):
+            window = windows.get(key)
+            if not window:
+                continue
+            candidates = [key]
+            if isinstance(window, dict):
+                stored_chat_id = window.get("chat_id")
+                if stored_chat_id and stored_chat_id != key:
+                    candidates.append(stored_chat_id)
+            for candidate in candidates:
+                # A stored group window can never be a DM's alias; skipping it
+                # keeps a group whose digits match a phone number out.
+                if not self._chat_id_is_aliasable(candidate):
+                    continue
+                if normalize_whatsapp_identifier(candidate) in aliases:
+                    return window
+        return None
+
+    def _effective_reply_prefix(self, chat_id: Optional[str] = None) -> str:
+        """Resolve outgoing reply prefix for a given target chat.
+
+        Resolution order:
+        1. Per-engagement window reply_prefix override (if set and non-None).
+        2. Engagement-default override — env WHATSAPP_ENGAGEMENT_REPLY_PREFIX
+           or config engagement_reply_prefix (only when chat is engaged).
+           Falls through to empty string when engaged but no override.
+        3. General prefix resolution from WhatsAppBehaviorMixin.
+        """
+        # 1. Per-engagement override.
+        if chat_id:
+            engagement = self._engagement_record(chat_id)
+            if engagement is not None and engagement.get("reply_prefix") is not None:
+                raw = engagement["reply_prefix"]
+                return raw.replace("\\n", "\n") if raw else ""
+
+        # 2. Engagement default override (active only if chat is engaged).
+        if chat_id and self._engagement_active_for_chat(chat_id):
+            cfg = self.config.extra.get("engagement_reply_prefix")
+            if cfg is not None:
+                return cfg.replace("\\n", "\n")
+            env = os.getenv("WHATSAPP_ENGAGEMENT_REPLY_PREFIX")
+            if env is not None:
+                return env.replace("\\n", "\n")
+            # Engaged but no explicit override — use empty prefix.
+            return ""
+
+        # 3. General reply prefix (mixin behaviour).
+        return super()._effective_reply_prefix()
+
+    # ------------------------------------------------------------------
+    # Unified inbound-event handler (called from poll loop)
+    # ------------------------------------------------------------------
+
+    async def _handle_incoming_event(self, data: dict) -> None:
+        """Process a single raw inbound event from the bridge.
+
+        Steps (in order):
+        1. Emit message:received hook (always, before any gating).
+        2. If observe_only, return — the hook owns these events outright.
+        3. Dispatch to agent (the DM/group/mention policy gate lives inside
+           _build_message_event, which _dispatch_to_agent calls).
+        """
+        # 1. Emit hook before gating.
+        if self._hook_registry is not None:
+            try:
+                await self._hook_registry.emit("message:received", data)
+            except Exception:
+                logger.exception("[%s] message:received hook raised", self.name)
+
+        # 2. Observe-only events belong to the hook and to nothing else.
+        #
+        # This used to read "return UNLESS an engagement window is active",
+        # which made an open window a second writer on the conversation rather
+        # than the single owner of it. The watcher hook already holds a
+        # complete decision-and-send path of its own (invoke.invoke_agent_reply
+        # -> the bridge's /send), so dispatching the same event onward gave the
+        # chat two independent authors.
+        #
+        # On 2026-08-17 that shipped an external contact Hermes's canned
+        # unauthorized-DM pairing text ("Hi~ I don't recognize you yet! Here's
+        # your pairing code: ...") in the middle of an engagement — the normal
+        # gateway did not recognise him, and answered on its own. He learned
+        # the account was automated, from the automation. Had he instead been
+        # an authorized user, the same routing would have produced two full
+        # agent replies to one message.
+        #
+        # The bridge already calls these events "historical — don't engage the
+        # agent" (scripts/whatsapp-bridge/bridge.js), so returning here is the
+        # observe-only contract restored, not a new restriction. Note this is
+        # deliberately unconditional: the dispatch decision no longer depends
+        # on engagement state at all, which is what stops the two from being
+        # re-coupled by a later edit. `whatsapp.unauthorized_dm_behavior:
+        # ignore` on the VPS is defence in depth behind this, not a substitute
+        # for it — it would not have stopped the duplicate-reply half.
+        if data.get("observe_only"):
+            return
+
+        # 3. Dispatch to agent.
+        #
+        # NOTE: there is deliberately no _should_process_message() call here.
+        # It is the first statement of _build_message_event() (called below via
+        # _dispatch_to_agent), so gating an extra time at this level was purely
+        # redundant — same predicate, same `data`, no side effects in between.
+        # Upstream 0.19 treats _build_message_event as the single intake
+        # chokepoint (its own _poll_messages does `event = await
+        # _build_message_event(...); if event:`) and its read-receipt tests
+        # assert that shape. Keeping the duplicate short-circuited those tests
+        # before they reached the gate. Rejected messages still never reach the
+        # agent and still never get a read receipt.
+        await self._dispatch_to_agent(data)
+
+    async def _dispatch_to_agent(self, data: dict) -> None:
+        """Build a MessageEvent from raw data and hand it off to handle_message.
+
+        TEXT events go through the debounce batcher (rapid-fire messages get
+        concatenated into one agent invocation); everything else dispatches
+        immediately.
+        """
+        event = await self._build_message_event(data)
+        if event:
+            # Fire-and-forget: a slow bridge /read must not delay message
+            # dispatch (matches BlueBubbles asyncio.create_task pattern for
+            # mark_read). Upstream 0.19 put this in _poll_messages; the watcher
+            # patch moved event-building here, so the receipt follows it — it
+            # still fires only for messages that survived _should_process_message
+            # (called inside _build_message_event), i.e. policy-accepted ones.
+            asyncio.create_task(self._send_read_receipt(data))
+            if event.message_type == MessageType.TEXT:
+                self._enqueue_text_event(event)
+            else:
+                await self.handle_message(event)
 
     def _bridge_url(self, path: str) -> str:
         return f"http://127.0.0.1:{self._bridge_port}/{path}"
@@ -604,6 +879,94 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         except Exception as e:
             return SendResult(success=False, error=str(e))
 
+    async def _bridge_post(
+        self,
+        chat_id: str,
+        text: str,
+        reply_to: Optional[str] = None,
+        mark_read: Optional[bool] = None,
+        typing_enabled: Optional[bool] = None,
+    ) -> Dict[str, Any]:
+        """Low-level POST of a single text chunk to the bridge /send endpoint.
+
+        Returns the parsed JSON response dict.  Raises on HTTP error or
+        connection failure.
+        """
+        payload: Dict[str, Any] = {"chatId": chat_id, "message": text}
+        if reply_to:
+            payload["replyTo"] = reply_to
+        if mark_read is not None:
+            payload["mark_read"] = mark_read
+        if typing_enabled is not None:
+            payload["typing_enabled"] = typing_enabled
+
+        # 0.21.3 port: route through the adapter's own request helper rather
+        # than hand-building the URL and an aiohttp timeout. Upstream
+        # centralised both behind _bridge_req; duplicating them here meant this
+        # path silently missed whatever that helper does for every other call.
+        async with self._bridge_req("post", "send", 30, json=payload) as resp:
+            if resp.status == 200:
+                return await resp.json()
+            error = await resp.text()
+            raise RuntimeError(f"Bridge /send error {resp.status}: {error}")
+
+    async def send_message(
+        self,
+        chat_id: str,
+        text: str,
+        *,
+        hermes_origin: bool = True,
+        reply_to: Optional[str] = None,
+        mark_read: Optional[bool] = None,
+        typing_enabled: Optional[bool] = None,
+    ) -> SendResult:
+        """Send a single text message and emit the message:sent hook.
+
+        This is the hook-aware façade over _bridge_post.  The existing
+        ``send()`` method handles formatting + chunking; this method is
+        intentionally thin — one bridge call, one hook emission.
+
+        ``mark_read`` and ``typing_enabled`` control bridge-side side-effects.
+        When either is None the value is derived from the current mode: in
+        self-chat mode both default to False; otherwise both default to True.
+        """
+        whatsapp_mode = os.getenv("WHATSAPP_MODE", "self-chat")
+        is_self_chat = whatsapp_mode == "self-chat"
+        if mark_read is None:
+            mark_read = not is_self_chat
+        if typing_enabled is None:
+            typing_enabled = not is_self_chat
+        try:
+            result = await self._bridge_post(
+                chat_id, text,
+                reply_to=reply_to,
+                mark_read=mark_read,
+                typing_enabled=typing_enabled,
+            )
+        except Exception as e:
+            return SendResult(success=False, error=str(e))
+
+        message_id = result.get("message_id") or result.get("messageId")
+
+        event: Dict[str, Any] = {
+            "chatId": chat_id,
+            "messageId": message_id,
+            "body": text,
+            "hermes_origin": hermes_origin,
+            "direction": "out",
+        }
+        timestamp = result.get("timestamp")
+        if timestamp is not None:
+            event["timestamp"] = timestamp
+
+        if self._hook_registry is not None:
+            try:
+                await self._hook_registry.emit("message:sent", event)
+            except Exception:
+                logger.exception("[%s] message:sent hook raised", self.name)
+
+        return SendResult(success=True, message_id=message_id)
+
     @_needs_bridge
     async def edit_message(self, chat_id: str, message_id: str, content: str, *, finalize: bool = False) -> SendResult:
         try:
@@ -713,14 +1076,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 async with self._bridge_req("get", "messages", 30) as resp:
                     if resp.status == 200:
                         for msg_data in await resp.json():
-                            event = await self._build_message_event(msg_data)
-                            if event:
-                                # Fire-and-forget: a slow bridge /read must not delay dispatch.
-                                asyncio.create_task(self._send_read_receipt(msg_data))
-                                if event.message_type == MessageType.TEXT:
-                                    self._enqueue_text_event(event)
-                                else:
-                                    await self.handle_message(event)
+                            await self._handle_incoming_event(msg_data)
             except asyncio.CancelledError:
                 break
             except Exception as e:
