@@ -161,6 +161,15 @@ async def build_channel_directory(adapters: Dict[Any, Any]) -> Dict[str, Any]:
         from gateway.platform_registry import platform_registry
         for entry in platform_registry.plugin_entries():
             await _discover(entry.name)
+    # Merge watcher-managed contacts into the whatsapp section so that
+    # send_message(target="whatsapp:<name>") can resolve them even if no
+    # Hermes session has been started for that chat yet — and even when no
+    # whatsapp adapter is currently connected. 0.18 only seeds the "whatsapp"
+    # platform key on live connect, so read through .get() and set the key
+    # ourselves rather than guarding on its presence.
+    watcher_whatsapp = _merge_whatsapp_watcher_contacts(platforms.get("whatsapp", []))
+    if watcher_whatsapp:
+        platforms["whatsapp"] = watcher_whatsapp
     _apply_channel_aliases(platforms)
     directory = {"updated_at": datetime.now().isoformat(), "platforms": platforms}
     try:
@@ -314,6 +323,48 @@ async def _build_slack(adapter) -> List[Dict[str, Any]]:
         seen_ids.add(eid)
     await _slack_resolve_raw_names(next(iter(team_clients.values())), channels)
     return channels
+
+
+def _merge_whatsapp_watcher_contacts(
+    existing: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Merge watcher-managed contacts from contacts.json into the whatsapp list.
+
+    Reads ``~/.hermes/whatsapp/contacts.json`` (written by the watcher hook).
+    Each contact becomes a directory entry with the watcher's canonical_name
+    so that ``send_message(target="whatsapp:<name>")`` can resolve it even
+    before a Hermes session for that chat has been started.
+
+    Deduplication is by ``id`` (chat_id).  Entries already present from
+    session discovery are kept; watcher entries fill the gaps.
+    """
+    contacts_path = get_hermes_home() / "whatsapp" / "contacts.json"
+    if not contacts_path.exists():
+        return existing
+
+    try:
+        with open(contacts_path, encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        logger.debug("Channel directory: failed to read watcher contacts: %s", e)
+        return existing
+
+    seen_ids = {ch.get("id") for ch in existing}
+    merged = list(existing)
+
+    for contact in data.get("contacts", []):
+        chat_id = contact.get("chat_id")
+        if not chat_id or chat_id in seen_ids:
+            continue
+        seen_ids.add(chat_id)
+        merged.append({
+            "id": chat_id,
+            "name": contact.get("canonical_name", chat_id),
+            "type": "group" if contact.get("is_group") else "dm",
+            "thread_id": None,
+        })
+
+    return merged
 
 
 def _build_from_sessions(platform_name: str) -> List[Dict[str, str]]:
