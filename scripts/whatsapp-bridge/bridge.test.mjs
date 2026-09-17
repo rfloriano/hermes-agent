@@ -231,7 +231,7 @@ test('formatOutgoingMessage with prefixOverride="" returns raw message in self-c
 
 test('formatOutgoingMessage with no opts uses default REPLY_PREFIX in self-chat mode', () => {
   // When no prefixOverride is supplied the default prefix must be prepended.
-  const DEFAULT_REPLY_PREFIX = '⚕ *Hermes Agent*\n────────────\n';
+  const DEFAULT_REPLY_PREFIX = '☤ *Hermes Agent*\n────────────\n';
   assert.equal(
     formatOutgoingMessage('hi', {}, 'self-chat'),
     `${DEFAULT_REPLY_PREFIX}hi`,
