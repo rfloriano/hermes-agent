@@ -226,22 +226,32 @@ def check_systemd_timing_alignment(
 
 
 def _systemd_timeout_stop_us(unit_name: str) -> Optional[int]:
-    """``TimeoutStopUSec`` of ``unit_name`` in microseconds; ``--user`` first (hermes' usual)."""
+    """``TimeoutStopUSec`` of ``unit_name`` in microseconds; ``--user`` first (hermes' usual).
+
+    A scope that does not have the unit still answers ``show`` with exit 0 and systemd's
+    *default* (90s), marked ``LoadState=not-found``. Taking that answer made a system-scoped
+    gateway on a host with a running user manager warn about its correct unit on every start,
+    so only a ``loaded`` unit's value counts.
+    """
     for flag in (["--user"], []):
         try:
             result = subprocess.run(
-                ["systemctl", *flag, "show", unit_name, "--property=TimeoutStopUSec"],
+                ["systemctl", *flag, "show", unit_name,
+                 "--property=TimeoutStopUSec", "--property=LoadState"],
                 capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=2.0,
             )
         except (subprocess.TimeoutExpired, OSError):
             continue
-        # Output: "TimeoutStopUSec=1min 30s" or "TimeoutStopUSec=90000000"
-        for line in result.stdout.splitlines() if result.returncode == 0 else ():
-            if line.startswith("TimeoutStopUSec="):
-                value = line.split("=", 1)[1].strip()
-                timeout_us = int(value) if value.isdigit() else parse_systemd_duration_to_us(value)
-                if timeout_us is not None:
-                    return timeout_us
+        if result.returncode != 0:
+            continue
+        # Output: "TimeoutStopUSec=1min 30s" or "TimeoutStopUSec=90000000", plus "LoadState=loaded"
+        props = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+        if props.get("LoadState", "").strip() != "loaded":
+            continue
+        value = props.get("TimeoutStopUSec", "").strip()
+        timeout_us = int(value) if value.isdigit() else parse_systemd_duration_to_us(value)
+        if timeout_us is not None:
+            return timeout_us
     return None
 
 
