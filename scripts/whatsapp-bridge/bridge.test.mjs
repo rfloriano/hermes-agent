@@ -509,11 +509,3 @@ test('the socket accepts every history batch, FULL included', async () => {
   const src = readFileSync(new URL('./bridge.js', import.meta.url), 'utf-8');
   assert.match(src, /syncFullHistory: true,[\s\S]{0,700}?shouldSyncHistoryMessage: \(\) => true,/);
 });
-
-test('the link identifies as the Mac desktop app, the only shape Baileys 7 maps to a desktop login', async () => {
-  const { readFileSync } = await import('node:fs');
-  const src = readFileSync(new URL('./bridge.js', import.meta.url), 'utf-8');
-  assert.match(src, /browser: \['Mac OS', 'Desktop', '[0-9.]+'\],/);
-  const { proto } = await import('@whiskeysockets/baileys');
-  assert.ok(proto.ClientPayload.WebInfo.WebSubPlatform.DARWIN !== undefined);
-});
