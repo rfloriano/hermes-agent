@@ -788,6 +788,12 @@ async function startSocket() {
     printQRInTerminal: false,
     browser: ['Hermes Agent', 'Desktop', '120.0'],
     syncFullHistory: true,
+    // syncFullHistory only ASKS WhatsApp for the deep dump. Baileys 7's default
+    // shouldSyncHistoryMessage then drops every batch WhatsApp labels FULL
+    // (Defaults/index.js: `syncType !== FULL`), so a Desktop link came back with
+    // the RECENT window only: about three months on 2026-11-12, where the same
+    // link in May (older Baileys, default "process everything") reached 2023.
+    shouldSyncHistoryMessage: () => true,
     markOnlineOnConnect: false,
     // Required for Baileys 7.x: without this, incoming messages that need
     // E2EE session re-establishment are silently dropped (msg.message === null)
@@ -1347,9 +1353,19 @@ async function startSocket() {
   // live-message queue, which would overflow on a multi-thousand dump.
   // Skips events tagged with peerDataRequestSessionId — those are /backfill
   // responses already handled by waitForHistoryEvent.
-  sock.ev.on('messaging-history.set', ({ messages, isLatest, peerDataRequestSessionId }) => {
+  sock.ev.on('messaging-history.set', ({ messages, isLatest, peerDataRequestSessionId, syncType, chunkOrder, progress }) => {
     if (peerDataRequestSessionId) return;
     if (!Array.isArray(messages) || messages.length === 0) return;
+    // Oldest and newest message of the batch: with syncType this is the only
+    // record of how deep a sync went (the Baileys logger runs at warn).
+    let oldestTs = 0;
+    let newestTs = 0;
+    for (const m of messages) {
+      const ts = Number(m?.messageTimestamp || 0);
+      if (!ts) continue;
+      if (!oldestTs || ts < oldestTs) oldestTs = ts;
+      if (ts > newestTs) newestTs = ts;
+    }
 
     let written = 0;
     let skipped = 0;
@@ -1366,6 +1382,11 @@ async function startSocket() {
       skipped_dup: skipped,
       total: messages.length,
       isLatest: !!isLatest,
+      syncType: syncType ?? null,
+      chunkOrder: chunkOrder ?? null,
+      progress: progress ?? null,
+      oldest: oldestTs ? new Date(oldestTs * 1000).toISOString().slice(0, 10) : null,
+      newest: newestTs ? new Date(newestTs * 1000).toISOString().slice(0, 10) : null,
     });
   });
 }

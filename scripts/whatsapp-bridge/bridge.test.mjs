@@ -501,3 +501,11 @@ test('the live handler marks an observed own message as fromMe', async () => {
   const src = readFileSync(new URL('./bridge.js', import.meta.url), 'utf-8');
   assert.match(src, /if \(observeOnly\) \{\s*event\.observe_only = true;[\s\S]{0,600}?if \(msg\.key\.fromMe\) event\.fromMe = true;/);
 });
+
+test('the socket accepts every history batch, FULL included', async () => {
+  // Baileys 7 defaults to skipping FULL batches. Without this override a
+  // Desktop relink returns about three months instead of years, silently.
+  const { readFileSync } = await import('node:fs');
+  const src = readFileSync(new URL('./bridge.js', import.meta.url), 'utf-8');
+  assert.match(src, /syncFullHistory: true,[\s\S]{0,700}?shouldSyncHistoryMessage: \(\) => true,/);
+});
