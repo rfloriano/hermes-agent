@@ -457,3 +457,37 @@ test('/health surfaces reconnect state', () => {
   assert.match(src, /reconnectAttempts:\s*reconnectAttemptsTotal/);
   assert.match(src, /reconnectAttemptsByClass:/);
 });
+
+
+// --- the owner's own DMs outside the self-chat --------------------------------
+//
+// Upstream's self-chat rule drops a fromMe DM whose chat is not the owner's own.
+// With the watcher on, that left the archive with inbound messages only, and an
+// engagement never learned that the owner had answered by hand.
+
+const ownDmToContact = {
+  key: { remoteJid: '5511999990000@s.whatsapp.net', fromMe: true, id: 'OWN-DM-1' },
+  message: { conversation: 'respondendo eu mesmo' },
+  messageTimestamp: 1,
+};
+
+test('own DM in someone else\'s chat is forwarded observe-only when the watcher observes', () => {
+  const r = processIncoming(ownDmToContact, { mode: 'self-chat', observeNonSelf: true, isSelfChat: false });
+  assert.equal(r.action, 'forward');
+  assert.equal(r.payload.observe_only, true, 'bare, it would read as a self-chat prompt');
+  assert.equal(r.payload.fromMe, true);
+  assert.equal(r.payload.chatId, '5511999990000@s.whatsapp.net');
+});
+
+test('own DM in someone else\'s chat is still dropped without the watcher', () => {
+  const r = processIncoming(ownDmToContact, { mode: 'self-chat', observeNonSelf: false, isSelfChat: false });
+  assert.deepEqual(r, { action: 'ignore', reason: 'self_chat_mismatch' });
+});
+
+test('the owner\'s chat with themselves is still a prompt, never observe-only', () => {
+  for (const isSelfChat of [true, undefined]) {
+    const r = processIncoming(ownDmToContact, { mode: 'self-chat', observeNonSelf: true, isSelfChat });
+    assert.equal(r.action, 'forward');
+    assert.equal(r.payload.observe_only, undefined);
+  }
+});

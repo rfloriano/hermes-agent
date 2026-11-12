@@ -278,3 +278,27 @@ class TestBuildMessageEventOwnsTheIntakeGate:
         # TEXT events go through the debounce batcher rather than
         # handle_message() directly.
         adapter._enqueue_text_event.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_owner_dm_in_a_contacts_chat_reaches_the_hook_and_never_the_agent():
+    """The bridge now forwards a message the owner typed in someone else's chat
+    (fromMe, observe_only). The hook must see it; the agent must not: dispatched,
+    a fromMe DM reads as a self-chat prompt and the reply lands in that chat."""
+    adapter = WhatsAppAdapter(PlatformConfig(enabled=True, extra={}))
+    hooks = MagicMock()
+    hooks.emit = AsyncMock()
+    adapter.set_hook_registry(hooks)
+    adapter._dispatch_to_agent = AsyncMock()
+    data = {
+        "chatId": "5511999990000@s.whatsapp.net",
+        "senderId": "5511999990000@s.whatsapp.net",
+        "fromMe": True,
+        "observe_only": True,
+        "body": "respondendo eu mesmo",
+        "messageId": "OWN-DM-1",
+    }
+    await adapter._handle_incoming_event(data)
+    hooks.emit.assert_awaited()
+    assert hooks.emit.await_args.args[0] == "message:received"
+    adapter._dispatch_to_agent.assert_not_awaited()

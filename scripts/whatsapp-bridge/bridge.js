@@ -287,8 +287,10 @@ function extractText(msg) {
  * @param {object} opts
  * @param {string} opts.mode - 'self-chat' | 'bot'
  * @param {boolean} [opts.observeNonSelf] - defaults to module-level OBSERVE_NON_SELF
+ * @param {boolean} [opts.isSelfChat] - the handler's answer to "is this DM the
+ *   owner's chat with themselves". Omitted (the old call shape) means "assume yes".
  */
-export function processIncoming(msg, { mode, observeNonSelf = OBSERVE_NON_SELF }) {
+export function processIncoming(msg, { mode, observeNonSelf = OBSERVE_NON_SELF, isSelfChat }) {
   const chatId = msg.key.remoteJid;
   const fromMe = !!msg.key.fromMe;
   const isGroup = chatId.endsWith('@g.us');
@@ -311,6 +313,14 @@ export function processIncoming(msg, { mode, observeNonSelf = OBSERVE_NON_SELF }
   };
 
   if (fromMe) {
+    if (mode === 'self-chat' && !isGroup && isSelfChat === false) {
+      // The owner's own message in someone else's chat: observed for the
+      // watcher, never processed as a prompt (see the upsert handler).
+      if (observeNonSelf) {
+        return { action: 'forward', payload: { ...payload, observe_only: true } };
+      }
+      return { action: 'ignore', reason: 'self_chat_mismatch' };
+    }
     if (mode === 'self-chat' && !isGroup) {
       // The user's own message to themselves — process normally.
       // Tag if the bridge originated this send so downstream hook handlers
@@ -1101,13 +1111,28 @@ async function startSocket() {
             accountLid: redactWhatsAppId(sock.user?.lid),
           });
           if (!isSelfChat) {
-            emitDebugEvent({
-              stage: 'ignored',
-              reason: 'self_chat_mismatch',
-              chatId: redactWhatsAppId(chatId),
-              senderId: redactWhatsAppId(senderId),
-            });
-            continue;
+            if (OBSERVE_NON_SELF) {
+              // Watcher OBSERVE mode: a message the owner typed on their own
+              // phone in someone else's chat. The watcher needs it: it is half
+              // of every conversation in the archive, and during an engagement
+              // it is the signal that the owner answered and the pending
+              // auto-reply must be cancelled. Dropping it here (the upstream
+              // self-chat rule) left the archive with inbound messages only.
+              //
+              // It MUST carry observe_only. Forwarded bare, a fromMe DM reads
+              // as a self-chat prompt and the agent would answer INTO this
+              // contact's chat. Echoes of Hermes's own sends to this chat are
+              // still dropped below (recentlySentIds), before anything is queued.
+              observeOnly = true;
+            } else {
+              emitDebugEvent({
+                stage: 'ignored',
+                reason: 'self_chat_mismatch',
+                chatId: redactWhatsAppId(chatId),
+                senderId: redactWhatsAppId(senderId),
+              });
+              continue;
+            }
           }
         }
       }
