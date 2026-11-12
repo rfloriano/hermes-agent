@@ -491,3 +491,13 @@ test('the owner\'s chat with themselves is still a prompt, never observe-only', 
     assert.equal(r.payload.observe_only, undefined);
   }
 });
+
+test('the live handler marks an observed own message as fromMe', async () => {
+  // The upsert handler is not unit-testable (it needs a socket), and it does not
+  // go through processIncoming. On 2026-11-12 the first observed own DM reached
+  // the archive as INBOUND because the forwarded event had no fromMe. Pin the
+  // line that sets it, next to the observe_only tag.
+  const { readFileSync } = await import('node:fs');
+  const src = readFileSync(new URL('./bridge.js', import.meta.url), 'utf-8');
+  assert.match(src, /if \(observeOnly\) \{\s*event\.observe_only = true;[\s\S]{0,600}?if \(msg\.key\.fromMe\) event\.fromMe = true;/);
+});

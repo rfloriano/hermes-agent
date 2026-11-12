@@ -1315,7 +1315,15 @@ async function startSocket() {
       // them without engaging the agent. extractBridgeEvent (above) already
       // produced every field the watcher reads; observe_only is the only
       // watcher-specific addition here (fromOwner was set just above).
-      if (observeOnly) event.observe_only = true;
+      if (observeOnly) {
+        event.observe_only = true;
+        // The watcher tells the owner's messages from a contact's by this flag
+        // (in a DM the sender id is the chat id either way). extractBridgeEvent
+        // carries fromMe only inside readReceiptKey, so without it an observed
+        // own DM was archived as inbound, in the contact's name. Set only on
+        // observed events: the self-chat prompt path stays exactly as upstream.
+        if (msg.key.fromMe) event.fromMe = true;
+      }
       messageQueue.push(event);
       emitDebugEvent({
         stage: 'queued',
