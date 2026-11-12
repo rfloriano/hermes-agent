@@ -786,7 +786,13 @@ async function startSocket() {
     auth: state,
     logger,
     printQRInTerminal: false,
-    browser: ['Hermes Agent', 'Desktop', '120.0'],
+    // Baileys 7 announces the desktop app (webSubPlatform DARWIN) only when ALL of:
+    // syncFullHistory, browser[1] === 'Desktop', and browser[0] is exactly 'Mac OS'
+    // or 'Windows' (Utils/validate-connection.js, getWebInfo). With a custom label
+    // in the first slot the link registered as a desktop device but logged in as a
+    // WEB_BROWSER, and the history sync stopped at one year. The price is the name
+    // shown under Linked devices: a Mac desktop instead of "Hermes Agent".
+    browser: ['Mac OS', 'Desktop', '14.4.1'],
     syncFullHistory: true,
     // syncFullHistory only ASKS WhatsApp for the deep dump. Baileys 7's default
     // shouldSyncHistoryMessage then drops every batch WhatsApp labels FULL
