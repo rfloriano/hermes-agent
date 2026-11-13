@@ -786,7 +786,12 @@ async function startSocket() {
     auth: state,
     logger,
     printQRInTerminal: false,
-    browser: ['Hermes Agent', 'Desktop', '120.0'],
+    // EXPERIMENT (2026-11-12): register as the device type the official Mac
+    // app is (a Mac Catalyst build), to see whether the phone then offers
+    // "Load more messages" beyond one year. Baileys upper-cases browser[1] and
+    // looks it up in DeviceProps.PlatformType; only the registration changes,
+    // the login stays WEB_BROWSER as before ('Desktop' gave type DESKTOP).
+    browser: ['Hermes Agent', 'IOS_CATALYST', '120.0'],
     syncFullHistory: true,
     // syncFullHistory only ASKS WhatsApp for the deep dump. Baileys 7's default
     // shouldSyncHistoryMessage then drops every batch WhatsApp labels FULL
