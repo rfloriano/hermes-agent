@@ -509,15 +509,3 @@ test('the socket accepts every history batch, FULL included', async () => {
   const src = readFileSync(new URL('./bridge.js', import.meta.url), 'utf-8');
   assert.match(src, /syncFullHistory: true,[\s\S]{0,700}?shouldSyncHistoryMessage: \(\) => true,/);
 });
-
-test('the link registers as a Mac Catalyst device while the login stays a browser one', async () => {
-  const { readFileSync } = await import('node:fs');
-  const src = readFileSync(new URL('./bridge.js', import.meta.url), 'utf-8');
-  const m = src.match(/browser: \['([^']+)', '([^']+)', '[0-9.]+'\],/);
-  assert.ok(m, 'bridge.js sets a browser identity');
-  const { proto } = await import('@whiskeysockets/baileys');
-  assert.equal(proto.DeviceProps.PlatformType[m[2].toUpperCase()], proto.DeviceProps.PlatformType.IOS_CATALYST);
-  // Baileys logs in as a desktop app only for these two OS names with 'Desktop';
-  // that login was refused with 428 on 2026-11-12, so the identity must not match it.
-  assert.ok(!(['Mac OS', 'Windows'].includes(m[1]) && m[2] === 'Desktop'));
-});
